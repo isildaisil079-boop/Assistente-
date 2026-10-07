@@ -11,10 +11,23 @@ android {
         applicationId = "com.assistente.launcher"
         minSdk = 30
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.2"
+        versionCode = 5
+        versionName = "0.3"
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+    signingConfigs {
+        create("fixa") {
+            storeFile = file("assistente.jks")
+            storePassword = "assistente123"
+            keyAlias = "assistente"
+            keyPassword = "assistente123"
+        }
+    }
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("fixa")
         }
     }
     compileOptions {
