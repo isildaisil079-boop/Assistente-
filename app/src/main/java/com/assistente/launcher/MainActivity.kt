@@ -2,6 +2,8 @@ package com.assistente.launcher
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -20,19 +22,42 @@ import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
+import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import java.io.File
 import kotlin.concurrent.thread
 
-private const val NOME = "Aria"
+class Modelo(
+    val id: String,
+    val titulo: String,
+    val arquivo: String,
+    val url: String,
+    val mb: Int
+)
+
+val RAPIDO = Modelo(
+    "rapido", "Rápido (0,5B)", "modelo.task",
+    "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task",
+    550
+)
+val MELHOR = Modelo(
+    "melhor", "Melhor (1,5B)", "modelo_melhor.task",
+    "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv1280.task",
+    1600
+)
 
 class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
     private var llm: LlmInference? = null
     private var busy = false
     private var carregando = false
+    private var nomeIA = "Aria"
+    private var modeloAtual: Modelo = RAPIDO
     private val history = mutableListOf<Pair<String, String>>()
 
     private lateinit var face: TextView
@@ -44,13 +69,17 @@ class MainActivity : Activity() {
     private lateinit var downloadBtn: Button
 
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
-
-    private fun modelo() = File(filesDir, DownloadService.MODEL_FILE)
-    private fun parcial() = File(filesDir, DownloadService.MODEL_FILE + ".tmp")
+    private fun modelo() = File(filesDir, modeloAtual.arquivo)
+    private fun parcial() = File(filesDir, modeloAtual.arquivo + ".tmp")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        nomeIA = prefs.getString("nome", "Aria") ?: "Aria"
+        modeloAtual = if (prefs.getString("modelo", "rapido") == "melhor") MELHOR else RAPIDO
+        if (prefs.getBoolean("configurado", false)) mostrarChat() else mostrarSetup()
+    }
 
+    private fun novoRoot(): LinearLayout {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(Color.parseColor("#1A1A2E"))
@@ -59,20 +88,129 @@ class MainActivity : Activity() {
             v.setPadding(b.left, b.top, b.right, b.bottom)
             ins
         }
+        return root
+    }
+
+    private fun texto(t: String, size: Float, cor: String = "#FFFFFF") = TextView(this).apply {
+        text = t
+        textSize = size
+        setTextColor(Color.parseColor(cor))
+        setPadding(0, dp(6), 0, dp(6))
+    }
+
+    private fun ramTotalGb(): Double {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        return mi.totalMem / 1_000_000_000.0
+    }
+
+    // ---------- Ecrã de setup ----------
+    private fun mostrarSetup() {
+        ui.removeCallbacks(poll)
+        val root = novoRoot()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(20), dp(24), dp(20), dp(24))
+
+        val ram = ramTotalGb()
+        val recomendado = if (ram >= 5.0) MELHOR else RAPIDO
+        val jaConfigurado = prefs.getBoolean("configurado", false)
+
+        col.addView(texto("Vamos criar o teu assistente", 22f).apply {
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+        })
+        col.addView(texto("Nome do assistente:", 14f, "#A0A0C0"))
+        val nomeEdit = EditText(this).apply {
+            setText(nomeIA)
+            setTextColor(Color.WHITE)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+            setSingleLine()
+        }
+        col.addView(nomeEdit)
+
+        col.addView(texto("Modelo de IA:", 14f, "#A0A0C0"))
+        col.addView(
+            texto(
+                "O teu telemóvel tem cerca de ${String.format("%.1f", ram)} GB de RAM. Recomendado: ${recomendado.titulo}.",
+                13f, "#C0C0E0"
+            )
+        )
+        val grupo = RadioGroup(this)
+        val rb1 = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "${RAPIDO.titulo}, ${RAPIDO.mb} MB. Mais rápido, respostas mais simples."
+            setTextColor(Color.WHITE)
+        }
+        val rb2 = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "${MELHOR.titulo}, ${MELHOR.mb} MB. Escreve melhor, mas é mais lento."
+            setTextColor(Color.WHITE)
+        }
+        grupo.addView(rb1)
+        grupo.addView(rb2)
+        val escolhido = if (jaConfigurado) modeloAtual else recomendado
+        val marcado = if (escolhido.id == "melhor") rb2 else rb1
+        marcado.isChecked = true
+        col.addView(grupo)
+
+        col.addView(texto("Podes mudar isto mais tarde.", 12f, "#808098"))
+
+        val ok = Button(this).apply {
+            text = "Continuar"
+            setOnClickListener {
+                val n = nomeEdit.text.toString().trim().ifEmpty { "Aria" }
+                val m = if (rb2.isChecked) MELHOR else RAPIDO
+                llm?.close()
+                llm = null
+                carregando = false
+                history.clear()
+                nomeIA = n
+                modeloAtual = m
+                prefs.edit()
+                    .putString("nome", n)
+                    .putString("modelo", m.id)
+                    .putBoolean("configurado", true)
+                    .apply()
+                mostrarChat()
+            }
+        }
+        col.addView(ok)
+
+        root.addView(
+            ScrollView(this).apply { addView(col) },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        setContentView(root)
+    }
+
+    // ---------- Ecrã de chat ----------
+    private fun mostrarChat() {
+        val root = novoRoot()
 
         face = TextView(this).apply {
             text = "🙂"; textSize = 64f; gravity = Gravity.CENTER
         }
         val nome = TextView(this).apply {
-            text = NOME; textSize = 22f; setTextColor(Color.WHITE)
+            text = nomeIA; textSize = 22f; setTextColor(Color.WHITE)
             gravity = Gravity.CENTER; setTypeface(null, Typeface.BOLD)
         }
         status = TextView(this).apply {
             textSize = 13f; setTextColor(Color.parseColor("#A0A0C0"))
-            gravity = Gravity.CENTER; setPadding(dp(16), dp(4), dp(16), dp(8))
+            gravity = Gravity.CENTER; setPadding(dp(16), dp(4), dp(16), dp(4))
+        }
+        val cfg = TextView(this).apply {
+            text = "⚙ Mudar nome ou modelo"; textSize = 12f
+            setTextColor(Color.parseColor("#7C7CFF"))
+            gravity = Gravity.CENTER; setPadding(dp(8), dp(4), dp(8), dp(8))
+            setOnClickListener { abrirSetup() }
         }
         downloadBtn = Button(this).apply {
-            text = "Descarregar IA (~550 MB)"; visibility = View.GONE
+            visibility = View.GONE
             setOnClickListener { descarregar() }
         }
         chat = TextView(this).apply {
@@ -104,12 +242,26 @@ class MainActivity : Activity() {
         root.addView(face, LinearLayout.LayoutParams(match, wrap))
         root.addView(nome, LinearLayout.LayoutParams(match, wrap))
         root.addView(status, LinearLayout.LayoutParams(match, wrap))
+        root.addView(cfg, LinearLayout.LayoutParams(match, wrap))
         root.addView(downloadBtn, LinearLayout.LayoutParams(match, wrap))
         root.addView(scroll, LinearLayout.LayoutParams(match, 0, 1f))
         root.addView(row, LinearLayout.LayoutParams(match, wrap))
         setContentView(root)
 
         iniciar()
+    }
+
+    private fun abrirSetup() {
+        if (busy || DownloadService.running) {
+            status.text = "Espera um momento (a IA está ocupada ou a descarregar)."
+            return
+        }
+        mostrarSetup()
+    }
+
+    private fun textoBotao(): String {
+        val mb = if (parcial().exists()) parcial().length() / 1_000_000 else 0L
+        return if (mb > 0) "Continuar de onde parou" else "Descarregar IA (~${modeloAtual.mb} MB)"
     }
 
     private val poll = object : Runnable {
@@ -128,7 +280,7 @@ class MainActivity : Activity() {
                 ui.postDelayed(this, 1000)
             } else {
                 status.text = "Download interrompido ($mb MB guardados)\n${DownloadService.message}"
-                downloadBtn.text = if (mb > 0) "Continuar de onde parou" else "Descarregar IA (~550 MB)"
+                downloadBtn.text = textoBotao()
                 downloadBtn.visibility = View.VISIBLE
             }
         }
@@ -144,8 +296,8 @@ class MainActivity : Activity() {
         } else {
             val mb = if (parcial().exists()) parcial().length() / 1_000_000 else 0L
             status.text = if (mb > 0) "Download parcial: $mb MB guardados."
-            else "Falta descarregar o cérebro da IA (~550 MB). Usa Wi-Fi."
-            downloadBtn.text = if (mb > 0) "Continuar de onde parou" else "Descarregar IA (~550 MB)"
+            else "Falta descarregar o cérebro da IA (~${modeloAtual.mb} MB). Usa Wi-Fi."
+            downloadBtn.text = textoBotao()
             downloadBtn.visibility = View.VISIBLE
         }
     }
@@ -155,7 +307,10 @@ class MainActivity : Activity() {
         status.text = "A iniciar download…"
         try {
             DownloadService.running = true
-            startForegroundService(Intent(this, DownloadService::class.java))
+            val i = Intent(this, DownloadService::class.java)
+            i.putExtra("url", modeloAtual.url)
+            i.putExtra("file", modeloAtual.arquivo)
+            startForegroundService(i)
         } catch (e: Exception) {
             DownloadService.running = false
             status.text = "Não consegui iniciar o download: ${e.message}"
@@ -198,7 +353,7 @@ class MainActivity : Activity() {
         if (carregando || llm != null) return
         carregando = true
         downloadBtn.visibility = View.GONE
-        status.text = "A acordar a $NOME…"
+        status.text = "A acordar $nomeIA…"
         thread {
             try {
                 val opts = LlmInference.LlmInferenceOptions.builder()
@@ -224,8 +379,9 @@ class MainActivity : Activity() {
 
     private fun montarPrompt(txt: String): String {
         val sb = StringBuilder()
-        sb.append("<|im_start|>system\nTu és $NOME, assistente e amigo do utilizador. ")
-        sb.append("Responde sempre em português de Portugal, com frases curtas e simpáticas.<|im_end|>\n")
+        sb.append("<|im_start|>system\nTu és $nomeIA, assistente e amigo do utilizador. ")
+        sb.append("Responde sempre em português de Portugal, com frases curtas, completas e simpáticas. ")
+        sb.append("Usa pontuação e letras maiúsculas corretas. Não uses emojis nem símbolos estranhos.<|im_end|>\n")
         history.takeLast(6).forEach { (r, t) ->
             sb.append("<|im_start|>$r\n${t.take(300)}<|im_end|>\n")
         }
@@ -247,18 +403,29 @@ class MainActivity : Activity() {
         send.isEnabled = false
         add("Tu", txt)
         face.text = "🤔"
-        status.text = "$NOME está a pensar…"
+        status.text = "$nomeIA está a pensar…"
         val prompt = montarPrompt(txt)
+        val nomeNaHora = nomeIA
         thread {
             val resp = try {
-                m.generateResponse(prompt).replace("<|im_end|>", "").trim()
+                val so = LlmInferenceSession.LlmInferenceSessionOptions.builder()
+                    .setTopK(40)
+                    .setTemperature(0.4f)
+                    .build()
+                val s = LlmInferenceSession.createFromOptions(m, so)
+                try {
+                    s.addQueryChunk(prompt)
+                    s.generateResponse().replace("<|im_end|>", "").trim()
+                } finally {
+                    s.close()
+                }
             } catch (e: Throwable) {
                 "Erro: ${e.message}"
             }
             ui.post {
                 history.add("user" to txt)
                 history.add("assistant" to resp)
-                add(NOME, resp)
+                add(nomeNaHora, resp)
                 face.text = "🙂"
                 status.text = "Pronta (offline) ✅"
                 busy = false
