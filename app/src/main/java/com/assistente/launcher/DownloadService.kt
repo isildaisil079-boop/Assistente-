@@ -17,10 +17,6 @@ import kotlin.concurrent.thread
 
 class DownloadService : Service() {
     companion object {
-        const val MODEL_FILE = "modelo.task"
-        const val MODEL_URL =
-            "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task"
-
         @Volatile var running = false
         @Volatile var total = 0L
         @Volatile var message = ""
@@ -28,6 +24,8 @@ class DownloadService : Service() {
 
     private var worker: Thread? = null
     private var lastNotify = 0L
+    private var url = ""
+    private var file = ""
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -41,9 +39,20 @@ class DownloadService : Service() {
             notificacao("A preparar…", -1),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         )
+        val u = intent?.getStringExtra("url")
+        val f = intent?.getStringExtra("file")
+        if (u == null || f == null) {
+            running = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        url = u
+        file = f
         if (worker == null) {
             running = true
             message = ""
+            total = 0L
             worker = thread { trabalhar() }
         }
         return START_REDELIVER_INTENT
@@ -61,7 +70,7 @@ class DownloadService : Service() {
     }
 
     private fun tamanhoTmp(): Long {
-        val t = File(filesDir, "$MODEL_FILE.tmp")
+        val t = File(filesDir, "$file.tmp")
         return if (t.exists()) t.length() else 0L
     }
 
@@ -93,12 +102,12 @@ class DownloadService : Service() {
     }
 
     private fun baixar() {
-        val fim = File(filesDir, MODEL_FILE)
+        val fim = File(filesDir, file)
         if (fim.exists()) return
-        val tmp = File(filesDir, "$MODEL_FILE.tmp")
+        val tmp = File(filesDir, "$file.tmp")
         val ja = if (tmp.exists()) tmp.length() else 0L
 
-        val c = URL(MODEL_URL).openConnection() as HttpURLConnection
+        val c = URL(url).openConnection() as HttpURLConnection
         c.connectTimeout = 20000
         c.readTimeout = 30000
         c.instanceFollowRedirects = true
