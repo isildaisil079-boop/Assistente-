@@ -11,8 +11,8 @@ android {
         applicationId = "com.assistente.launcher"
         minSdk = 30
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.3"
+        versionCode = 8
+        versionName = "0.5"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -41,4 +41,5 @@ android {
 
 dependencies {
     implementation("com.google.mediapipe:tasks-genai:0.10.24")
+    implementation("com.google.guava:guava:33.4.0-android")
 }
