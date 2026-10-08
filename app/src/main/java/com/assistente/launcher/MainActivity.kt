@@ -73,6 +73,9 @@ class MainActivity : Activity() {
     private var ouvindo = false
     private var modoConversa = false
     private var silencios = 0
+    private val idiomas = listOf("pt-BR", "pt-PT", "pt")
+    private var idiomaIdx = 0
+    private var onDevice = true
 
     private lateinit var face: TextView
     private lateinit var status: TextView
@@ -92,6 +95,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         nomeIA = prefs.getString("nome", "Aria") ?: "Aria"
         modeloAtual = if (prefs.getString("modelo", "rapido") == "melhor") MELHOR else RAPIDO
+        idiomaIdx = prefs.getInt("stt_idioma", 0).coerceIn(0, idiomas.size - 1)
+        onDevice = prefs.getBoolean("stt_ondevice", true)
         iniciarTts()
         if (prefs.getBoolean("configurado", false)) mostrarChat() else mostrarSetup()
     }
@@ -569,9 +574,12 @@ class MainActivity : Activity() {
     }
 
     private fun criarReconhecedor(): SpeechRecognizer? {
-        val r = if (Build.VERSION.SDK_INT >= 33 && SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+        val r = if (onDevice && Build.VERSION.SDK_INT >= 33 &&
+            SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+        ) {
             SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
         } else if (SpeechRecognizer.isRecognitionAvailable(this)) {
+            onDevice = false
             SpeechRecognizer.createSpeechRecognizer(this)
         } else {
             return null
@@ -598,6 +606,10 @@ class MainActivity : Activity() {
                     ?.firstOrNull()?.trim().orEmpty()
                 if (txt.isNotEmpty()) {
                     silencios = 0
+                    prefs.edit()
+                        .putInt("stt_idioma", idiomaIdx)
+                        .putBoolean("stt_ondevice", onDevice)
+                        .apply()
                     processar(txt, true)
                 } else {
                     onError(SpeechRecognizer.ERROR_NO_MATCH)
@@ -620,12 +632,27 @@ class MainActivity : Activity() {
                         }
                     }
                     12, 13 -> {
-                        pararVoz()
-                        status.text = "Falta o pacote de voz em português. Instala-o nas definições de voz do telemóvel."
+                        if (idiomaIdx < idiomas.size - 1) {
+                            idiomaIdx++
+                            ui.post { ouvir() }
+                        } else if (onDevice && Build.VERSION.SDK_INT >= 33) {
+                            onDevice = false
+                            idiomaIdx = 0
+                            ui.post {
+                                recognizer?.destroy()
+                                recognizer = null
+                                ouvir()
+                            }
+                        } else {
+                            idiomaIdx = 0
+                            onDevice = true
+                            pararVoz()
+                            status.text = "O Android não tem reconhecimento de voz para português (erro $error). Verifica o pacote de reconhecimento."
+                        }
                     }
                     else -> {
                         pararVoz()
-                        status.text = "Erro de voz (código $error)."
+                        status.text = "Erro de voz (código $error, ${idiomas[idiomaIdx]})."
                     }
                 }
             }
@@ -651,15 +678,16 @@ class MainActivity : Activity() {
             return
         }
         recognizer = r
+        val lang = idiomas[idiomaIdx]
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-PT")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
         ouvindo = true
         face.text = "👂"
-        status.text = "A ouvir…"
+        status.text = "A ouvir… ($lang${if (onDevice) "" else ", modo normal"})"
         r.startListening(i)
     }
 
