@@ -371,7 +371,23 @@ class AssistenteService : Service() {
         ouvir()
     }
 
-    // ---------- Conversa com a IA (streaming) ----------
+    // Chamado pelo AlarmeReceiver quando um lembrete dispara
+    fun anunciar(texto: String) {
+        ui.post {
+            if (!iniciado) return@post
+            chatFixo += "$nomeIA: 🔔 $texto\n\n"
+            ouvinte?.atualizar()
+            val t = tts
+            if (t != null && ttsPronto) {
+                manterAcordado()
+                falasPend++
+                uttCount++
+                t.speak(texto, TextToSpeech.QUEUE_ADD, null, "anuncio$uttCount")
+            }
+        }
+    }
+
+    // ---------- Conversa ----------
     private fun manterAcordado() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val w = wl ?: pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "assistente:voz").also {
@@ -393,7 +409,42 @@ class AssistenteService : Service() {
         }
     }
 
+    // Primeiro tenta as ações (alarmes, notas, horas…). Se não for uma ação, usa a IA.
     private fun processar(txt: String, voz: Boolean) {
+        if (ocupado) return
+        val r = try { Acoes.tentar(this, txt) } catch (e: Throwable) { null }
+        if (r == null) {
+            processarLLM(txt, voz)
+        } else {
+            responderDireto(txt, r, voz)
+        }
+    }
+
+    private fun responderDireto(pergunta: String, resposta: String, voz: Boolean) {
+        manterAcordado()
+        if (chatFixo.length > 20000) chatFixo = chatFixo.takeLast(10000)
+        chatFixo += "Tu: $pergunta\n\n$nomeIA: $resposta\n\n"
+        chatParcial = ""
+        history.add("user" to pergunta)
+        history.add("assistant" to resposta)
+        geracaoId++
+        geracaoFim = true
+        falaIdx = 0
+        falasPend = 0
+        vozAtiva = voz
+        ocupado = false
+        if (voz) {
+            falarFrases(resposta, true)
+            if (!ttsPronto) estado("Voz em português não disponível no telemóvel.")
+            if (falasPend == 0) depoisDeFalar()
+        } else {
+            rosto("🙂")
+            estado(pronta())
+        }
+        ouvinte?.atualizar()
+    }
+
+    private fun processarLLM(txt: String, voz: Boolean) {
         val m = llm ?: return
         if (ocupado) return
         ocupado = true
