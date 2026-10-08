@@ -66,6 +66,21 @@ class MainActivity : Activity() {
     private var modeloAtual: Modelo = RAPIDO
     private val history = mutableListOf<Pair<String, String>>()
 
+    // geração em streaming
+    private var geracaoId = 0
+    private var chatBase = ""
+    private val respAcum = StringBuilder()
+    private var falaIdx = 0
+    private var falasPend = 0
+    private var uttCount = 0
+    private var geracaoFim = true
+    private var vozAtiva = false
+    private var nPartes = 0
+    private var t0 = 0L
+    private var tPrimeiro = 0L
+    private var ultimaParte = 0L
+    private var statsTxt = ""
+
     // voz
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
@@ -90,6 +105,7 @@ class MainActivity : Activity() {
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
     private fun modelo() = File(filesDir, modeloAtual.arquivo)
     private fun parcial() = File(filesDir, modeloAtual.arquivo + ".tmp")
+    private fun pronta() = "Pronta (offline) ✅$statsTxt"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -188,6 +204,7 @@ class MainActivity : Activity() {
                 llm = null
                 carregando = false
                 history.clear()
+                statsTxt = ""
                 nomeIA = n
                 modeloAtual = m
                 prefs.edit()
@@ -419,7 +436,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Conversa com a IA ----------
+    // ---------- Conversa com a IA (streaming) ----------
     private fun montarPrompt(txt: String, voz: Boolean): String {
         val sb = StringBuilder()
         sb.append("<|im_start|>system\nTu és $nomeIA, assistente e amigo do utilizador. ")
@@ -446,6 +463,18 @@ class MainActivity : Activity() {
         processar(txt, false)
     }
 
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!busy) return
+            if (System.currentTimeMillis() - ultimaParte > 90_000L) {
+                geracaoId++
+                terminarComErro("Sem resposta (tempo esgotado). Tenta de novo.")
+            } else {
+                ui.postDelayed(this, 10_000)
+            }
+        }
+    }
+
     private fun processar(txt: String, voz: Boolean) {
         val m = llm ?: return
         if (busy) return
@@ -453,48 +482,114 @@ class MainActivity : Activity() {
         send.isEnabled = false
         micBtn.isEnabled = false
         add("Tu", txt)
+        chatBase = chat.text.toString()
+        respAcum.setLength(0)
+        falaIdx = 0
+        falasPend = 0
+        geracaoFim = false
+        vozAtiva = voz
+        nPartes = 0
+        tPrimeiro = 0L
+        geracaoId++
+        val id = geracaoId
         face.text = "🤔"
         status.text = "$nomeIA está a pensar…"
         val prompt = montarPrompt(txt, voz)
         val nomeNaHora = nomeIA
+        t0 = System.currentTimeMillis()
+        ultimaParte = t0
+        ui.removeCallbacks(watchdog)
+        ui.postDelayed(watchdog, 10_000)
         thread {
-            var falhou = false
-            val resp = try {
+            try {
                 val so = LlmInferenceSession.LlmInferenceSessionOptions.builder()
                     .setTopK(40)
                     .setTemperature(0.4f)
                     .build()
                 val s = LlmInferenceSession.createFromOptions(m, so)
-                try {
-                    s.addQueryChunk(prompt)
-                    s.generateResponse().replace("<|im_end|>", "").trim()
-                } finally {
-                    s.close()
+                s.addQueryChunk(prompt)
+                s.generateResponseAsync { parte, done ->
+                    ui.post { receberParte(id, parte ?: "", done, nomeNaHora, txt, s) }
                 }
             } catch (e: Throwable) {
-                falhou = true
-                "Erro: ${e.message}"
-            }
-            ui.post {
-                if (!falhou) {
-                    history.add("user" to txt)
-                    history.add("assistant" to resp)
-                }
-                add(nomeNaHora, resp)
-                busy = false
-                send.isEnabled = true
-                micBtn.isEnabled = true
-                if (voz && !falhou) {
-                    falar(resp)
-                } else {
-                    face.text = "🙂"
-                    status.text = "Pronta (offline) ✅"
+                ui.post {
+                    if (id == geracaoId) terminarComErro("Erro: ${e.message}")
                 }
             }
         }
     }
 
-    // ---------- Voz: falar ----------
+    private fun receberParte(
+        id: Int, parte: String, done: Boolean,
+        nome: String, pergunta: String, s: LlmInferenceSession
+    ) {
+        if (done) {
+            ui.postDelayed({
+                try { s.close() } catch (_: Throwable) {}
+            }, 500)
+        }
+        if (id != geracaoId || !busy) return
+
+        ultimaParte = System.currentTimeMillis()
+        if (parte.isNotEmpty()) {
+            nPartes++
+            if (nPartes == 1) {
+                tPrimeiro = ultimaParte
+                if (!vozAtiva) status.text = "$nome está a escrever…"
+            }
+            respAcum.append(parte)
+        }
+        val limpo = respAcum.toString().replace("<|im_end|>", "").trimStart()
+
+        if (!done) {
+            chat.text = chatBase + "$nome: $limpo"
+            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+            if (vozAtiva) falarFrases(limpo, false)
+            return
+        }
+
+        geracaoFim = true
+        val resp = limpo.trim()
+        history.add("user" to pergunta)
+        history.add("assistant" to resp)
+        chat.text = chatBase + "$nome: $resp\n\n"
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        busy = false
+        send.isEnabled = true
+        micBtn.isEnabled = true
+
+        statsTxt = if (nPartes >= 2) {
+            val seg = (System.currentTimeMillis() - tPrimeiro) / 1000.0
+            val primeira = (tPrimeiro - t0) / 1000.0
+            String.format(
+                Locale.US, "\n1ª palavra: %.1f s · %.1f tokens/s",
+                primeira, nPartes / maxOf(seg, 0.1)
+            )
+        } else ""
+
+        if (vozAtiva) {
+            falarFrases(limpo, true)
+            if (!ttsPronto) status.text = "Voz em português não disponível no telemóvel."
+            if (falasPend == 0) depoisDeFalar()
+        } else {
+            face.text = "🙂"
+            status.text = pronta()
+        }
+    }
+
+    private fun terminarComErro(msg: String) {
+        busy = false
+        geracaoFim = true
+        vozAtiva = false
+        falasPend = 0
+        chat.text = chatBase + "$nomeIA: $msg\n\n"
+        send.isEnabled = true
+        micBtn.isEnabled = true
+        face.text = "🙂"
+        status.text = pronta()
+    }
+
+    // ---------- Voz: falar (frase a frase) ----------
     private fun iniciarTts() {
         tts = TextToSpeech(this) { st ->
             if (st == TextToSpeech.SUCCESS) {
@@ -507,11 +602,11 @@ class MainActivity : Activity() {
                     t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {}
                         override fun onDone(utteranceId: String?) {
-                            ui.post { depoisDeFalar() }
+                            ui.post { falaTerminou() }
                         }
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
-                            ui.post { depoisDeFalar() }
+                            ui.post { falaTerminou() }
                         }
                     })
                 }
@@ -519,22 +614,40 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun falar(texto: String) {
-        val t = tts
-        if (t == null || !ttsPronto) {
-            status.text = "Voz em português não disponível no telemóvel."
-            depoisDeFalar()
+    private fun falarFrases(texto: String, fim: Boolean) {
+        if (tts == null || !ttsPronto || !vozAtiva) return
+        if (falaIdx >= texto.length) return
+        val pend = texto.substring(falaIdx)
+        if (fim) {
+            falaIdx = texto.length
+            enfileirar(pend)
             return
         }
-        val limpo = texto.replace(Regex("[^\\p{L}\\p{N}\\p{P}\\p{Z}]"), " ")
+        val idx = pend.indexOfLast { it == '.' || it == '!' || it == '?' || it == '\n' }
+        if (idx >= 0) {
+            falaIdx += idx + 1
+            enfileirar(pend.substring(0, idx + 1))
+        }
+    }
+
+    private fun enfileirar(frase: String) {
+        val limpo = frase.replace(Regex("[^\\p{L}\\p{N}\\p{P}\\p{Z}]"), " ").trim()
+        if (limpo.isEmpty()) return
+        falasPend++
         face.text = "😄"
         status.text = "$nomeIA está a falar…"
-        t.speak(limpo, TextToSpeech.QUEUE_FLUSH, null, "resp")
+        uttCount++
+        tts?.speak(limpo, TextToSpeech.QUEUE_ADD, null, "resp$uttCount")
+    }
+
+    private fun falaTerminou() {
+        if (falasPend > 0) falasPend--
+        if (falasPend == 0 && geracaoFim) depoisDeFalar()
     }
 
     private fun depoisDeFalar() {
         face.text = "🙂"
-        if (!busy && !status.text.startsWith("Voz")) status.text = "Pronta (offline) ✅"
+        if (!busy && !status.text.startsWith("Voz")) status.text = pronta()
         if (modoConversa && !busy) ouvir()
     }
 
@@ -551,7 +664,7 @@ class MainActivity : Activity() {
     private fun alternarConversa() {
         if (modoConversa) {
             pararVoz()
-            status.text = "Pronta (offline) ✅"
+            status.text = pronta()
         } else {
             if (llm == null) {
                 status.text = "Espera: a IA ainda está a acordar."
@@ -567,6 +680,8 @@ class MainActivity : Activity() {
     private fun pararVoz() {
         modoConversa = false
         ouvindo = false
+        vozAtiva = false
+        falasPend = 0
         recognizer?.cancel()
         tts?.stop()
         if (::conversaBtn.isInitialized) conversaBtn.text = "🎧 Modo conversa: desligado"
@@ -701,6 +816,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         ui.removeCallbacks(poll)
+        ui.removeCallbacks(watchdog)
         recognizer?.destroy()
         tts?.shutdown()
         llm?.close()
