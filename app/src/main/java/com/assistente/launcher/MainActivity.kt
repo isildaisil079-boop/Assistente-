@@ -66,6 +66,11 @@ class MainActivity : Activity() {
     private var modeloAtual: Modelo = RAPIDO
     private val history = mutableListOf<Pair<String, String>>()
 
+    // sessão persistente (memória da conversa)
+    @Volatile private var sessao: LlmInferenceSession? = null
+    @Volatile private var ctxEst = 0
+    private var liberado = false
+
     // geração em streaming
     private var geracaoId = 0
     private var chatBase = ""
@@ -106,6 +111,7 @@ class MainActivity : Activity() {
     private fun modelo() = File(filesDir, modeloAtual.arquivo)
     private fun parcial() = File(filesDir, modeloAtual.arquivo + ".tmp")
     private fun pronta() = "Pronta (offline) ✅$statsTxt"
+    private fun estTokens(s: String) = s.length / 3 + 4
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -152,7 +158,13 @@ class MainActivity : Activity() {
         col.setPadding(dp(20), dp(24), dp(20), dp(24))
 
         val ram = ramTotalGb()
-        val recomendado = if (ram >= 5.0) MELHOR else RAPIDO
+        val tr = prefs.getFloat("tps_rapido", 0f)
+        val tm = prefs.getFloat("tps_melhor", 0f)
+        val recomendado = when {
+            tm > 0f -> if (tm >= 5f) MELHOR else RAPIDO
+            tr >= 15f && ram >= 5.0 -> MELHOR
+            else -> RAPIDO
+        }
         val jaConfigurado = prefs.getBoolean("configurado", false)
 
         col.addView(texto("Vamos criar o teu assistente", 22f).apply {
@@ -169,9 +181,13 @@ class MainActivity : Activity() {
         col.addView(nomeEdit)
 
         col.addView(texto("Modelo de IA:", 14f, "#A0A0C0"))
+        val medido = StringBuilder()
+        if (tr > 0f) medido.append("Rápido: ").append(String.format(Locale.US, "%.1f", tr)).append(" tokens/s. ")
+        if (tm > 0f) medido.append("Melhor: ").append(String.format(Locale.US, "%.1f", tm)).append(" tokens/s. ")
+        if (medido.isEmpty()) medido.append("Ainda não medi a velocidade deste telemóvel. Começa pelo Rápido.")
         col.addView(
             texto(
-                "O teu telemóvel tem cerca de ${String.format("%.1f", ram)} GB de RAM. Recomendado: ${recomendado.titulo}.",
+                "RAM: cerca de ${String.format(Locale.US, "%.1f", ram)} GB.\nVelocidade medida: $medido\nRecomendado: ${recomendado.titulo}.",
                 13f, "#C0C0E0"
             )
         )
@@ -183,7 +199,7 @@ class MainActivity : Activity() {
         }
         val rb2 = RadioButton(this).apply {
             id = View.generateViewId()
-            text = "${MELHOR.titulo}, ${MELHOR.mb} MB. Escreve melhor, mas é mais lento."
+            text = "${MELHOR.titulo}, ${MELHOR.mb} MB. Escreve melhor, mas é bem mais lento."
             setTextColor(Color.WHITE)
         }
         grupo.addView(rb1)
@@ -200,6 +216,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val n = nomeEdit.text.toString().trim().ifEmpty { "Aria" }
                 val m = if (rb2.isChecked) MELHOR else RAPIDO
+                resetSessao()
                 llm?.close()
                 llm = null
                 carregando = false
@@ -407,6 +424,7 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Carregar modelo + aquecer ----------
     private fun carregarModelo(f: File) {
         if (carregando || llm != null) return
         carregando = true
@@ -422,10 +440,7 @@ class MainActivity : Activity() {
                 val m = LlmInference.createFromOptions(this, opts)
                 ui.post {
                     llm = m
-                    status.text = "Pronta (offline) ✅"
-                    input.isEnabled = true
-                    send.isEnabled = true
-                    micBtn.isEnabled = true
+                    aquecer(m)
                 }
             } catch (e: Throwable) {
                 ui.post {
@@ -436,18 +451,77 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Conversa com a IA (streaming) ----------
-    private fun montarPrompt(txt: String, voz: Boolean): String {
-        val sb = StringBuilder()
-        sb.append("<|im_start|>system\nTu és $nomeIA, assistente e amigo do utilizador. ")
-        sb.append("Responde sempre em português de Portugal, com frases curtas, completas e simpáticas. ")
-        sb.append("Usa pontuação e letras maiúsculas corretas. Não uses emojis nem símbolos estranhos. ")
-        if (voz) sb.append("Estás numa conversa por voz: responde em no máximo duas frases curtas. ")
-        sb.append("<|im_end|>\n")
-        history.takeLast(6).forEach { (r, t) ->
-            sb.append("<|im_start|>$r\n${t.take(300)}<|im_end|>\n")
+    private fun aquecer(m: LlmInference) {
+        liberado = false
+        status.text = "A afinar $nomeIA para este telemóvel…"
+        ui.postDelayed({ if (!liberado) fimAquecer(null, 0.0) }, 60_000)
+        thread {
+            try {
+                val s = novaSessao(m)
+                s.addQueryChunk("<|im_start|>user\nConta de 1 a 10.<|im_end|>\n<|im_start|>assistant\n")
+                var n = 0
+                var tp = 0L
+                s.generateResponseAsync { parte, done ->
+                    if (parte != null && parte.isNotEmpty()) {
+                        n++
+                        if (n == 1) tp = System.currentTimeMillis()
+                    }
+                    if (done) {
+                        val seg = maxOf((System.currentTimeMillis() - tp) / 1000.0, 0.1)
+                        val tps = if (n >= 3) n / seg else 0.0
+                        ui.post { fimAquecer(s, tps) }
+                    }
+                }
+            } catch (e: Throwable) {
+                ui.post { fimAquecer(null, 0.0) }
+            }
         }
-        sb.append("<|im_start|>user\n$txt<|im_end|>\n<|im_start|>assistant\n")
+    }
+
+    private fun fecharLento(s: LlmInferenceSession?) {
+        if (s != null) {
+            ui.postDelayed({ try { s.close() } catch (_: Throwable) {} }, 500)
+        }
+    }
+
+    private fun fimAquecer(s: LlmInferenceSession?, tps: Double) {
+        fecharLento(s)
+        if (liberado) return
+        liberado = true
+        if (tps > 0.0) {
+            prefs.edit().putFloat("tps_${modeloAtual.id}", tps.toFloat()).apply()
+            statsTxt = String.format(Locale.US, "\nVelocidade medida: %.1f tokens/s", tps)
+        }
+        status.text = pronta()
+        input.isEnabled = true
+        send.isEnabled = true
+        micBtn.isEnabled = true
+    }
+
+    // ---------- Sessão com memória ----------
+    private fun novaSessao(m: LlmInference): LlmInferenceSession {
+        val so = LlmInferenceSession.LlmInferenceSessionOptions.builder()
+            .setTopK(40)
+            .setTemperature(0.4f)
+            .build()
+        return LlmInferenceSession.createFromOptions(m, so)
+    }
+
+    private fun resetSessao() {
+        val s = sessao
+        sessao = null
+        ctxEst = 0
+        try { s?.close() } catch (_: Throwable) {}
+    }
+
+    private fun promptNovo(msg: String): String {
+        val sb = StringBuilder()
+        sb.append("<|im_start|>system\nTu és $nomeIA, amigo e assistente do utilizador. ")
+        sb.append("Responde em português de Portugal, em frases curtas e corretas, sem emojis.<|im_end|>\n")
+        history.takeLast(4).forEach { (r, t) ->
+            sb.append("<|im_start|>$r\n${t.take(200)}<|im_end|>\n")
+        }
+        sb.append("<|im_start|>user\n$msg<|im_end|>\n<|im_start|>assistant\n")
         return sb.toString()
     }
 
@@ -494,7 +568,7 @@ class MainActivity : Activity() {
         val id = geracaoId
         face.text = "🤔"
         status.text = "$nomeIA está a pensar…"
-        val prompt = montarPrompt(txt, voz)
+        val msg = if (voz) "$txt\n(Responde em no máximo duas frases curtas.)" else txt
         val nomeNaHora = nomeIA
         t0 = System.currentTimeMillis()
         ultimaParte = t0
@@ -502,14 +576,23 @@ class MainActivity : Activity() {
         ui.postDelayed(watchdog, 10_000)
         thread {
             try {
-                val so = LlmInferenceSession.LlmInferenceSessionOptions.builder()
-                    .setTopK(40)
-                    .setTemperature(0.4f)
-                    .build()
-                val s = LlmInferenceSession.createFromOptions(m, so)
-                s.addQueryChunk(prompt)
-                s.generateResponseAsync { parte, done ->
-                    ui.post { receberParte(id, parte ?: "", done, nomeNaHora, txt, s) }
+                val atual = sessao
+                val sess: LlmInferenceSession
+                val chunk: String
+                if (atual == null || ctxEst + estTokens(msg) > 600) {
+                    resetSessao()
+                    sess = novaSessao(m)
+                    sessao = sess
+                    chunk = promptNovo(msg)
+                    ctxEst = estTokens(chunk)
+                } else {
+                    sess = atual
+                    chunk = "\n<|im_start|>user\n$msg<|im_end|>\n<|im_start|>assistant\n"
+                    ctxEst += estTokens(chunk)
+                }
+                sess.addQueryChunk(chunk)
+                sess.generateResponseAsync { parte, done ->
+                    ui.post { receberParte(id, parte ?: "", done, nomeNaHora, txt) }
                 }
             } catch (e: Throwable) {
                 ui.post {
@@ -521,13 +604,8 @@ class MainActivity : Activity() {
 
     private fun receberParte(
         id: Int, parte: String, done: Boolean,
-        nome: String, pergunta: String, s: LlmInferenceSession
+        nome: String, pergunta: String
     ) {
-        if (done) {
-            ui.postDelayed({
-                try { s.close() } catch (_: Throwable) {}
-            }, 500)
-        }
         if (id != geracaoId || !busy) return
 
         ultimaParte = System.currentTimeMillis()
@@ -552,6 +630,7 @@ class MainActivity : Activity() {
         val resp = limpo.trim()
         history.add("user" to pergunta)
         history.add("assistant" to resp)
+        ctxEst += estTokens(resp) + 5
         chat.text = chatBase + "$nome: $resp\n\n"
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
         busy = false
@@ -578,6 +657,7 @@ class MainActivity : Activity() {
     }
 
     private fun terminarComErro(msg: String) {
+        resetSessao()
         busy = false
         geracaoFim = true
         vozAtiva = false
@@ -819,6 +899,7 @@ class MainActivity : Activity() {
         ui.removeCallbacks(watchdog)
         recognizer?.destroy()
         tts?.shutdown()
+        resetSessao()
         llm?.close()
         super.onDestroy()
     }
