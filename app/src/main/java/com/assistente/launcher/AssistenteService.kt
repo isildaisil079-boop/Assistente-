@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -22,6 +23,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.speech.RecognitionListener
+import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
@@ -45,6 +47,8 @@ class AssistenteService : Service() {
         const val ACAO_FALAR = "com.assistente.launcher.FALAR"
         const val ACAO_PARAR = "com.assistente.launcher.PARAR"
         const val CANAL = "assistente"
+        const val GOOGLE_PKG = "com.google.android.googlequicksearchbox"
+        const val GOOGLE_SVC = "com.google.android.voicesearch.serviceapi.GoogleRecognitionService"
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -95,10 +99,14 @@ class AssistenteService : Service() {
     private var tts: TextToSpeech? = null
     private var ttsPronto = false
     private var ouvindo = false
+    private var escutaPronta = false
     private var silencios = 0
+    private var tentativas = 0
+    private var ultimoErro = 0
     private val idiomas = listOf("pt-BR", "pt-PT", "pt")
     private var idiomaIdx = 0
-    private var onDevice = true
+    private val motores = listOf("no aparelho", "sistema", "Google")
+    private var engIdx = 0
 
     private var sessaoMidia: MediaSession? = null
     private var wl: PowerManager.WakeLock? = null
@@ -211,7 +219,8 @@ class AssistenteService : Service() {
         nomeIA = prefs.getString("nome", "Aria") ?: "Aria"
         modeloAtual = if (prefs.getString("modelo", "rapido") == "melhor") MELHOR else RAPIDO
         idiomaIdx = prefs.getInt("stt_idioma", 0).coerceIn(0, idiomas.size - 1)
-        onDevice = prefs.getBoolean("stt_ondevice", true)
+        val padrao = if (prefs.getBoolean("stt_ondevice", true)) 0 else 1
+        engIdx = prefs.getInt("stt_motor", padrao).coerceIn(0, motores.size - 1)
     }
 
     private fun carregarModelo() {
@@ -326,6 +335,7 @@ class AssistenteService : Service() {
             recognizer?.stopListening()
         } else {
             silencios = 0
+            tentativas = 0
             ouvir()
         }
     }
@@ -341,6 +351,7 @@ class AssistenteService : Service() {
         } else {
             modoConversa = true
             silencios = 0
+            tentativas = 0
             ouvir()
         }
         ouvinte?.atualizar()
@@ -351,6 +362,7 @@ class AssistenteService : Service() {
         ouvindo = false
         vozAtiva = false
         falasPend = 0
+        ui.removeCallbacks(timeoutEscuta)
         try { recognizer?.cancel() } catch (_: Throwable) {}
         try { tts?.stop() } catch (_: Throwable) {}
         rosto("🙂")
@@ -368,6 +380,7 @@ class AssistenteService : Service() {
             return
         }
         silencios = 0
+        tentativas = 0
         ouvir()
     }
 
@@ -620,7 +633,7 @@ class AssistenteService : Service() {
         if (modoConversa && !ocupado) ouvir()
     }
 
-    // ---------- Voz: ouvir ----------
+    // ---------- Voz: ouvir (3 motores, com recuperação) ----------
     private fun bipe() {
         try {
             val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
@@ -630,19 +643,74 @@ class AssistenteService : Service() {
         }
     }
 
-    private fun criarReconhecedor(): SpeechRecognizer? {
-        val r = if (onDevice && Build.VERSION.SDK_INT >= 33 &&
-            SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
-        ) {
-            SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-        } else if (SpeechRecognizer.isRecognitionAvailable(this)) {
-            onDevice = false
-            SpeechRecognizer.createSpeechRecognizer(this)
-        } else {
-            return null
+    private fun googleInstalado(): Boolean = try {
+        packageManager.getApplicationInfo(GOOGLE_PKG, 0).enabled
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Se o motor não responder em 6 s, passa ao seguinte
+    private val timeoutEscuta = Runnable {
+        if (ouvindo && !escutaPronta) proximoMotor(-1)
+    }
+
+    private fun proximoMotor(codigo: Int) {
+        ultimoErro = codigo
+        ui.removeCallbacks(timeoutEscuta)
+        try { recognizer?.destroy() } catch (_: Throwable) {}
+        recognizer = null
+        ouvindo = false
+        engIdx++
+        idiomaIdx = 0
+        tentativas++
+        if (engIdx >= motores.size || tentativas > 6) {
+            falhaTotal()
+            return
         }
+        ui.post { ouvir() }
+    }
+
+    private fun falhaTotal() {
+        pararVoz()
+        engIdx = 0
+        idiomaIdx = 0
+        tentativas = 0
+        val servicos = try {
+            packageManager.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
+                .joinToString(", ") { it.serviceInfo.packageName }
+        } catch (_: Throwable) {
+            "?"
+        }
+        val erro = if (ultimoErro == -1) "sem resposta" else "erro $ultimoErro"
+        val google = if (googleInstalado()) "" else "\nA app Google não está instalada ou está desativada."
+        estado(
+            "Não consegui usar o reconhecimento de voz ($erro).$google\n" +
+                "Serviços de voz encontrados: ${if (servicos.isEmpty()) "nenhum" else servicos}"
+        )
+    }
+
+    private fun criarReconhecedor(): SpeechRecognizer? {
+        val r: SpeechRecognizer? = try {
+            when (engIdx) {
+                0 -> if (Build.VERSION.SDK_INT >= 33 &&
+                    SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+                ) SpeechRecognizer.createOnDeviceSpeechRecognizer(this) else null
+                1 -> if (SpeechRecognizer.isRecognitionAvailable(this))
+                    SpeechRecognizer.createSpeechRecognizer(this) else null
+                else -> if (googleInstalado())
+                    SpeechRecognizer.createSpeechRecognizer(this, ComponentName(GOOGLE_PKG, GOOGLE_SVC))
+                else null
+            }
+        } catch (e: Throwable) {
+            null
+        }
+        if (r == null) return null
+
         r.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onReadyForSpeech(params: Bundle?) {
+                escutaPronta = true
+                ui.removeCallbacks(timeoutEscuta)
+            }
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -657,15 +725,17 @@ class AssistenteService : Service() {
             }
 
             override fun onResults(results: Bundle?) {
+                ui.removeCallbacks(timeoutEscuta)
                 ouvindo = false
                 val txt = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()?.trim().orEmpty()
                 if (txt.isNotEmpty()) {
                     silencios = 0
+                    tentativas = 0
                     prefs.edit()
                         .putInt("stt_idioma", idiomaIdx)
-                        .putBoolean("stt_ondevice", onDevice)
+                        .putInt("stt_motor", engIdx)
                         .apply()
                     processar(txt, true)
                 } else {
@@ -674,10 +744,14 @@ class AssistenteService : Service() {
             }
 
             override fun onError(error: Int) {
+                val estava = ouvindo
+                ui.removeCallbacks(timeoutEscuta)
                 ouvindo = false
                 rosto("🙂")
                 when (error) {
-                    SpeechRecognizer.ERROR_CLIENT -> {}
+                    SpeechRecognizer.ERROR_CLIENT -> {
+                        if (estava) proximoMotor(error)
+                    }
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT, SpeechRecognizer.ERROR_NO_MATCH -> {
                         silencios++
                         if (modoConversa && silencios < 3) {
@@ -692,25 +766,26 @@ class AssistenteService : Service() {
                         if (idiomaIdx < idiomas.size - 1) {
                             idiomaIdx++
                             ui.post { ouvir() }
-                        } else if (onDevice && Build.VERSION.SDK_INT >= 33) {
-                            onDevice = false
-                            idiomaIdx = 0
-                            ui.post {
-                                try { recognizer?.destroy() } catch (_: Throwable) {}
-                                recognizer = null
-                                ouvir()
-                            }
                         } else {
-                            idiomaIdx = 0
-                            onDevice = true
-                            pararVoz()
-                            estado("O Android não tem reconhecimento de voz para português (erro $error). Verifica o pacote de reconhecimento.")
+                            proximoMotor(error)
                         }
                     }
-                    else -> {
-                        pararVoz()
-                        estado("Erro de voz (código $error, ${idiomas[idiomaIdx]}).")
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                        tentativas++
+                        try { recognizer?.destroy() } catch (_: Throwable) {}
+                        recognizer = null
+                        if (tentativas > 6) {
+                            ultimoErro = error
+                            falhaTotal()
+                        } else {
+                            ui.postDelayed({ if (!ouvindo) ouvir() }, 600)
+                        }
                     }
+                    SpeechRecognizer.ERROR_AUDIO -> {
+                        pararVoz()
+                        estado("Erro de áudio (código 3). Verifica se outra app está a usar o microfone.")
+                    }
+                    else -> proximoMotor(error)
                 }
             }
         })
@@ -726,13 +801,22 @@ class AssistenteService : Service() {
         }
         try { tts?.stop() } catch (_: Throwable) {}
         manterAcordado()
-        val r = recognizer ?: criarReconhecedor()
-        if (r == null) {
-            pararVoz()
-            estado("Reconhecimento de voz indisponível neste telemóvel.")
+
+        var tmp = recognizer
+        while (tmp == null && engIdx < motores.size) {
+            tmp = criarReconhecedor()
+            if (tmp == null) {
+                engIdx++
+                idiomaIdx = 0
+            }
+        }
+        if (tmp == null) {
+            falhaTotal()
             return
         }
+        val r: SpeechRecognizer = tmp
         recognizer = r
+
         val lang = idiomas[idiomaIdx]
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -741,14 +825,18 @@ class AssistenteService : Service() {
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
         ouvindo = true
+        escutaPronta = false
         rosto("👂")
-        estado("A ouvir… ($lang${if (onDevice) "" else ", modo normal"})", false)
+        estado("A ouvir… ($lang · ${motores[engIdx]})", false)
         bipe()
         ui.postDelayed({
             if (ouvindo) {
-                try { r.startListening(i) } catch (e: Throwable) {
-                    ouvindo = false
-                    estado("Erro ao ouvir: ${e.message}")
+                try {
+                    r.startListening(i)
+                    ui.removeCallbacks(timeoutEscuta)
+                    ui.postDelayed(timeoutEscuta, 6000)
+                } catch (e: Throwable) {
+                    proximoMotor(-2)
                 }
             }
         }, 300)
