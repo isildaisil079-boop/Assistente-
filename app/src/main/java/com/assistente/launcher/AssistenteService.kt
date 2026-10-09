@@ -32,6 +32,8 @@ import android.view.KeyEvent
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.google.mediapipe.tasks.genai.llminference.LlmInferenceSession
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
 import java.util.Locale
 import kotlin.concurrent.thread
 
@@ -107,6 +109,8 @@ class AssistenteService : Service() {
     private var idiomaIdx = 0
     private val motores = listOf("no aparelho", "sistema", "Google")
     private var engIdx = 0
+    private val falhas = StringBuilder()
+    private var usarDialogo = false
 
     private var sessaoMidia: MediaSession? = null
     private var wl: PowerManager.WakeLock? = null
@@ -324,9 +328,74 @@ class AssistenteService : Service() {
         return sb.toString()
     }
 
+    // ---------- Correção de acentos (texto com bytes mal descodificados) ----------
+    private val mapaBytes: Map<Char, Int> by lazy {
+        val m = HashMap<Char, Int>()
+        var n = 0
+        for (b in 0..255) {
+            val direto = (b in 33..126) || (b in 161..172) || (b in 174..255)
+            if (direto) {
+                m[b.toChar()] = b
+            } else {
+                m[(256 + n).toChar()] = b
+                n++
+            }
+        }
+        m
+    }
+
+    private fun consertarUtf8(s: String): String {
+        if (s.none { it.code > 127 }) return s
+        val sb = StringBuilder()
+        var i = 0
+        while (i < s.length) {
+            val b0 = mapaBytes[s[i]]
+            if (b0 != null && b0 in 0xC2..0xF4) {
+                val len = if (b0 >= 0xF0) 4 else if (b0 >= 0xE0) 3 else 2
+                if (i + len <= s.length) {
+                    val bytes = ByteArray(len)
+                    bytes[0] = b0.toByte()
+                    var ok = true
+                    for (k in 1 until len) {
+                        val bk = mapaBytes[s[i + k]]
+                        if (bk == null || bk < 0x80 || bk > 0xBF) {
+                            ok = false
+                            break
+                        }
+                        bytes[k] = bk.toByte()
+                    }
+                    if (ok) {
+                        try {
+                            val dec = Charsets.UTF_8.newDecoder()
+                                .onMalformedInput(CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                .decode(ByteBuffer.wrap(bytes)).toString()
+                            sb.append(dec)
+                            i += len
+                            continue
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
+            sb.append(s[i])
+            i++
+        }
+        return sb.toString()
+    }
+
     // ---------- API usada pela app ----------
     fun enviarTexto(txt: String) {
         if (pronto && !ocupado) processar(txt, false)
+    }
+
+    fun processarVoz(txt: String) {
+        if (pronto && !ocupado) processar(txt, true)
+    }
+
+    fun vozErro(msg: String) {
+        rosto("🙂")
+        estado(msg)
     }
 
     fun tocarMic() {
@@ -336,6 +405,7 @@ class AssistenteService : Service() {
         } else {
             silencios = 0
             tentativas = 0
+            falhas.setLength(0)
             ouvir()
         }
     }
@@ -352,6 +422,7 @@ class AssistenteService : Service() {
             modoConversa = true
             silencios = 0
             tentativas = 0
+            falhas.setLength(0)
             ouvir()
         }
         ouvinte?.atualizar()
@@ -381,6 +452,7 @@ class AssistenteService : Service() {
         }
         silencios = 0
         tentativas = 0
+        falhas.setLength(0)
         ouvir()
     }
 
@@ -522,7 +594,7 @@ class AssistenteService : Service() {
             }
             respAcum.append(parte)
         }
-        val limpo = respAcum.toString().replace("<|im_end|>", "").trimStart()
+        val limpo = consertarUtf8(respAcum.toString().replace("<|im_end|>", "")).trimStart()
 
         if (!done) {
             chatParcial = "$nome: $limpo"
@@ -633,7 +705,7 @@ class AssistenteService : Service() {
         if (modoConversa && !ocupado) ouvir()
     }
 
-    // ---------- Voz: ouvir (3 motores, com recuperação) ----------
+    // ---------- Voz: ouvir (3 motores, com recuperação e ditado do sistema) ----------
     private fun bipe() {
         try {
             val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
@@ -649,6 +721,12 @@ class AssistenteService : Service() {
         false
     }
 
+    private fun descErro(c: Int) = when (c) {
+        -1 -> "sem resposta"
+        -2 -> "falha ao iniciar"
+        else -> "erro $c"
+    }
+
     // Se o motor não responder em 6 s, passa ao seguinte
     private val timeoutEscuta = Runnable {
         if (ouvindo && !escutaPronta) proximoMotor(-1)
@@ -657,6 +735,8 @@ class AssistenteService : Service() {
     private fun proximoMotor(codigo: Int) {
         ultimoErro = codigo
         ui.removeCallbacks(timeoutEscuta)
+        falhas.append(motores[engIdx.coerceIn(0, motores.size - 1)])
+            .append(": ").append(descErro(codigo)).append("; ")
         try { recognizer?.destroy() } catch (_: Throwable) {}
         recognizer = null
         ouvindo = false
@@ -667,26 +747,40 @@ class AssistenteService : Service() {
             falhaTotal()
             return
         }
-        ui.post { ouvir() }
+        ui.postDelayed({ ouvir() }, 1200)
     }
 
     private fun falhaTotal() {
-        pararVoz()
-        engIdx = 0
-        idiomaIdx = 0
-        tentativas = 0
+        val resumo = falhas.toString().trim()
         val servicos = try {
             packageManager.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
                 .joinToString(", ") { it.serviceInfo.packageName }
         } catch (_: Throwable) {
             "?"
         }
-        val erro = if (ultimoErro == -1) "sem resposta" else "erro $ultimoErro"
-        val google = if (googleInstalado()) "" else "\nA app Google não está instalada ou está desativada."
-        estado(
-            "Não consegui usar o reconhecimento de voz ($erro).$google\n" +
-                "Serviços de voz encontrados: ${if (servicos.isEmpty()) "nenhum" else servicos}"
-        )
+        val google = if (googleInstalado()) "app Google ativa" else "app Google ausente ou desativada"
+        pararVoz()
+        engIdx = 0
+        idiomaIdx = 0
+        tentativas = 0
+        falhas.setLength(0)
+        usarDialogo = true
+        chatFixo += "ℹ️ Voz automática indisponível. $resumo ($google). " +
+            "Serviços de voz: ${if (servicos.isEmpty()) "nenhum" else servicos}.\n\n"
+        ouvinte?.atualizar()
+        abrirDialogo()
+    }
+
+    private fun abrirDialogo() {
+        modoConversa = false
+        try {
+            startActivity(
+                Intent(this, VozActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            estado("Ditado do sistema aberto. Fala agora.", false)
+        } catch (e: Throwable) {
+            estado("Não consegui abrir o ditado do sistema. Abre a app e toca em 🎤.")
+        }
     }
 
     private fun criarReconhecedor(): SpeechRecognizer? {
@@ -733,6 +827,7 @@ class AssistenteService : Service() {
                 if (txt.isNotEmpty()) {
                     silencios = 0
                     tentativas = 0
+                    falhas.setLength(0)
                     prefs.edit()
                         .putInt("stt_idioma", idiomaIdx)
                         .putInt("stt_motor", engIdx)
@@ -776,6 +871,7 @@ class AssistenteService : Service() {
                         recognizer = null
                         if (tentativas > 6) {
                             ultimoErro = error
+                            falhas.append("ocupado; ")
                             falhaTotal()
                         } else {
                             ui.postDelayed({ if (!ouvindo) ouvir() }, 600)
@@ -799,6 +895,10 @@ class AssistenteService : Service() {
             estado("Falta a permissão do microfone. Abre a app e autoriza.")
             return
         }
+        if (usarDialogo) {
+            abrirDialogo()
+            return
+        }
         try { tts?.stop() } catch (_: Throwable) {}
         manterAcordado()
 
@@ -806,6 +906,7 @@ class AssistenteService : Service() {
         while (tmp == null && engIdx < motores.size) {
             tmp = criarReconhecedor()
             if (tmp == null) {
+                falhas.append(motores[engIdx]).append(": indisponível; ")
                 engIdx++
                 idiomaIdx = 0
             }
