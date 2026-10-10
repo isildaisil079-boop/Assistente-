@@ -8,9 +8,10 @@ import android.speech.RecognizerIntent
 class VozActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val tag = getSharedPreferences("cfg", MODE_PRIVATE).getString("idioma", "pt-PT") ?: "pt-PT"
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-PT")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
             putExtra(RecognizerIntent.EXTRA_PROMPT, "Fala agora…")
         }
         try {
