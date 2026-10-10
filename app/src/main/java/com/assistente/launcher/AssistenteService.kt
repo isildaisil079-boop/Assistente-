@@ -55,6 +55,7 @@ class AssistenteService : Service() {
 
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+    private val whisper by lazy { TranscritorWhisper(applicationContext) }
 
     // estado visível pela app
     var estadoTxt = "A iniciar…"
@@ -95,12 +96,15 @@ class AssistenteService : Service() {
     private var tPrimeiro = 0L
     private var ultimaParte = 0L
     private var statsTxt = ""
+    private var sttTxt = ""
 
     // voz
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsPronto = false
-    private var ouvindo = false
+    @Volatile private var ouvindo = false
+    @Volatile private var idEscuta = 0
+    private var ouvindoWhisper = false
     private var escutaPronta = false
     private var silencios = 0
     private var tentativas = 0
@@ -110,13 +114,21 @@ class AssistenteService : Service() {
     private val motores = listOf("no aparelho", "sistema", "Google")
     private var engIdx = 0
     private val falhas = StringBuilder()
-    private var usarDialogo = false
+    private var sistemaFalhou = false
+    private var ofertaVista = false
+    private var baixandoVoz = false
 
     private var sessaoMidia: MediaSession? = null
     private var wl: PowerManager.WakeLock? = null
 
-    private fun pronta() = "Pronta (offline) ✅$statsTxt"
+    private fun pronta() = "Pronta (offline) ✅$statsTxt$sttTxt"
     private fun estTokens(s: String) = s.length / 3 + 4
+
+    private fun versaoApp(): Long = try {
+        packageManager.getPackageInfo(packageName, 0).longVersionCode
+    } catch (_: Throwable) {
+        0L
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -150,9 +162,11 @@ class AssistenteService : Service() {
         iniciado = false
         instance = null
         pronto = false
+        idEscuta++
         ui.removeCallbacksAndMessages(null)
         try { recognizer?.destroy() } catch (_: Throwable) {}
         try { tts?.shutdown() } catch (_: Throwable) {}
+        try { whisper.liberar() } catch (_: Throwable) {}
         resetSessao()
         try { llm?.close() } catch (_: Throwable) {}
         try { sessaoMidia?.release() } catch (_: Throwable) {}
@@ -225,6 +239,7 @@ class AssistenteService : Service() {
         idiomaIdx = prefs.getInt("stt_idioma", 0).coerceIn(0, idiomas.size - 1)
         val padrao = if (prefs.getBoolean("stt_ondevice", true)) 0 else 1
         engIdx = prefs.getInt("stt_motor", padrao).coerceIn(0, motores.size - 1)
+        sistemaFalhou = prefs.getLong("sistema_falhou", -1L) == versaoApp()
     }
 
     private fun carregarModelo() {
@@ -398,10 +413,14 @@ class AssistenteService : Service() {
         estado(msg)
     }
 
+    private fun pararEscutaAtual() {
+        if (ouvindoWhisper) whisper.terminarJa() else recognizer?.stopListening()
+    }
+
     fun tocarMic() {
         if (!pronto) return
         if (ouvindo) {
-            recognizer?.stopListening()
+            pararEscutaAtual()
         } else {
             silencios = 0
             tentativas = 0
@@ -431,6 +450,8 @@ class AssistenteService : Service() {
     fun pararVoz() {
         modoConversa = false
         ouvindo = false
+        ouvindoWhisper = false
+        idEscuta++
         vozAtiva = false
         falasPend = 0
         ui.removeCallbacks(timeoutEscuta)
@@ -447,7 +468,7 @@ class AssistenteService : Service() {
             return
         }
         if (ouvindo) {
-            recognizer?.stopListening()
+            pararEscutaAtual()
             return
         }
         silencios = 0
@@ -473,13 +494,13 @@ class AssistenteService : Service() {
     }
 
     // ---------- Conversa ----------
-    private fun manterAcordado() {
+    private fun manterAcordado(minutos: Long = 2) {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val w = wl ?: pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "assistente:voz").also {
             it.setReferenceCounted(false)
             wl = it
         }
-        w.acquire(2 * 60 * 1000L)
+        w.acquire(minutos * 60 * 1000L)
     }
 
     private val watchdog = object : Runnable {
@@ -494,9 +515,14 @@ class AssistenteService : Service() {
         }
     }
 
-    // Primeiro tenta as ações (alarmes, notas, horas…). Se não for uma ação, usa a IA.
+    // Primeiro os comandos de voz, depois as ações (alarmes, notas, horas…), por fim a IA.
     private fun processar(txt: String, voz: Boolean) {
         if (ocupado) return
+        val cmd = try { comandoVoz(txt) } catch (e: Throwable) { null }
+        if (cmd != null) {
+            responderDireto(txt, cmd, voz)
+            return
+        }
         val r = try { Acoes.tentar(this, txt) } catch (e: Throwable) { null }
         if (r == null) {
             processarLLM(txt, voz)
@@ -705,7 +731,148 @@ class AssistenteService : Service() {
         if (modoConversa && !ocupado) ouvir()
     }
 
-    // ---------- Voz: ouvir (3 motores, com recuperação e ditado do sistema) ----------
+    // ---------- Comandos sobre a voz (escritos ou falados) ----------
+    private fun usarWhisper(): Boolean =
+        whisper.instalado() && (sistemaFalhou || prefs.getBoolean("whisper_pref", false))
+
+    private fun comandoVoz(txt: String): String? {
+        val t = Acoes.norm(txt)
+        if (t.length > 60 || !Regex("""\bvoz\b""").containsMatchIn(t)) return null
+        if (Regex("""\b(descarreg\w*|instal\w*)\b""").containsMatchIn(t)) return iniciarDownloadVoz()
+        if (Regex("""\b(usar|usa|ativar|ativa|muda|mudar)\b.*\bsistema\b""").containsMatchIn(t)) {
+            prefs.edit().putBoolean("whisper_pref", false).putLong("sistema_falhou", -1L).apply()
+            sistemaFalhou = false
+            engIdx = 0
+            idiomaIdx = 0
+            return "Combinado. Vou tentar a voz do sistema."
+        }
+        if (Regex("""\b(usar|usa|ativar|ativa)\b.*\bpropria\b""").containsMatchIn(t)) {
+            if (!whisper.instalado()) return "A voz própria ainda não está instalada. Escreve: descarregar voz."
+            prefs.edit().putBoolean("whisper_pref", true).apply()
+            return "Combinado. Passo a usar a voz própria."
+        }
+        if (Regex("""\bestado\b""").containsMatchIn(t)) {
+            val sis = if (sistemaFalhou) "indisponível" else "ativa"
+            val prop = when {
+                !whisper.instalado() -> "não instalada"
+                usarWhisper() -> "instalada e em uso"
+                else -> "instalada"
+            }
+            return "Voz do sistema $sis. Voz própria $prop."
+        }
+        return null
+    }
+
+    private fun iniciarDownloadVoz(): String {
+        if (whisper.instalado()) return "A voz própria já está instalada."
+        if (baixandoVoz) return "Já estou a descarregar a voz própria."
+        descarregarVoz()
+        return "Combinado. A descarregar a voz própria, cerca de ${TranscritorWhisper.TOTAL_MB} MB. " +
+            "Podes bloquear o ecrã. Aviso quando terminar."
+    }
+
+    private fun descarregarVoz() {
+        baixandoVoz = true
+        manterAcordado(20)
+        estado("A descarregar a voz própria… 0%")
+        thread {
+            try {
+                whisper.baixarTudo { i, n, pct ->
+                    ui.post {
+                        if (baixandoVoz) {
+                            estado("A descarregar a voz própria… ficheiro $i/$n · $pct%", pct % 10 == 0)
+                        }
+                    }
+                }
+                ui.post {
+                    baixandoVoz = false
+                    prefs.edit().putBoolean("whisper_pref", true).apply()
+                    chatFixo += "$nomeIA: 🔔 A voz própria está pronta. Toca em 🎤 e fala.\n\n"
+                    estado(pronta())
+                    ouvinte?.atualizar()
+                    anunciar("A voz própria está pronta.")
+                }
+            } catch (e: Throwable) {
+                ui.post {
+                    baixandoVoz = false
+                    estado("Erro ao descarregar a voz: ${e.message}. Escreve «descarregar voz» para continuar.")
+                }
+            }
+        }
+    }
+
+    // ---------- Voz própria (Whisper) ----------
+    private val liberarWhisper = Runnable { if (!ouvindo) whisper.liberar() }
+
+    private fun agendarLiberarWhisper() {
+        ui.removeCallbacks(liberarWhisper)
+        ui.postDelayed(liberarWhisper, 3 * 60_000L)
+    }
+
+    private fun ouvirWhisper() {
+        if (ouvindo || ocupado || !pronto) return
+        try { tts?.stop() } catch (_: Throwable) {}
+        manterAcordado()
+        ouvindo = true
+        ouvindoWhisper = true
+        val id = ++idEscuta
+        ui.removeCallbacks(liberarWhisper)
+        rosto("👂")
+        estado("A ouvir… (voz própria)", false)
+        bipe()
+        ui.postDelayed({
+            if (!ouvindo || id != idEscuta) return@postDelayed
+            whisper.ouvir(
+                aoComecarFala = {
+                    ui.post { if (id == idEscuta) estado("A ouvir… (a falar)", false) }
+                },
+                aoTranscrever = {
+                    ui.post {
+                        if (id == idEscuta) {
+                            rosto("🤔")
+                            estado("A transcrever…", false)
+                        }
+                    }
+                },
+                cancelado = { id != idEscuta || !ouvindo },
+                aoFinal = { texto, ms, erro -> ui.post { fimWhisper(id, texto, ms, erro) } }
+            )
+        }, 350)
+    }
+
+    private fun fimWhisper(id: Int, texto: String?, ms: Long, erro: String?) {
+        if (id != idEscuta) return
+        ouvindo = false
+        ouvindoWhisper = false
+        rosto("🙂")
+        agendarLiberarWhisper()
+        if (erro != null) {
+            pararVoz()
+            estado("Erro na voz própria: $erro")
+            return
+        }
+        val t = texto?.trim().orEmpty()
+        if (t.length < 2) {
+            semFala()
+            return
+        }
+        silencios = 0
+        sttTxt = String.format(Locale.US, "\nTranscrição: %.1f s", ms / 1000.0)
+        processar(t, true)
+    }
+
+    private fun semFala() {
+        silencios++
+        if (modoConversa && silencios < 3) {
+            estado("Não ouvi nada, a tentar de novo…", false)
+            ui.postDelayed({ if (modoConversa && !ouvindo && !ocupado) ouvir() }, 800)
+        } else {
+            pararVoz()
+            estado("Não te ouvi. Toca em 🎤 para tentar de novo.")
+        }
+    }
+
+    // ---------- Voz do sistema (3 motores, com recuperação) ----------
     private fun bipe() {
         try {
             val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
@@ -764,11 +931,21 @@ class AssistenteService : Service() {
         idiomaIdx = 0
         tentativas = 0
         falhas.setLength(0)
-        usarDialogo = true
-        chatFixo += "ℹ️ Voz automática indisponível. $resumo ($google). " +
-            "Serviços de voz: ${if (servicos.isEmpty()) "nenhum" else servicos}.\n\n"
-        ouvinte?.atualizar()
-        abrirDialogo()
+        sistemaFalhou = true
+        prefs.edit().putLong("sistema_falhou", versaoApp()).apply()
+        if (whisper.instalado()) {
+            chatFixo += "ℹ️ Voz do sistema indisponível ($resumo). A usar a voz própria.\n\n"
+            ouvinte?.atualizar()
+            ui.postDelayed({ ouvir() }, 300)
+        } else {
+            ofertaVista = true
+            chatFixo += "ℹ️ Voz do sistema indisponível ($resumo; $google; serviços: " +
+                "${if (servicos.isEmpty()) "nenhum" else servicos}). Para conversar por voz com o ecrã " +
+                "apagado e com mais fiabilidade, escreve: descarregar voz (cerca de " +
+                "${TranscritorWhisper.TOTAL_MB} MB, usa Wi-Fi). Entretanto uso o ditado do sistema.\n\n"
+            ouvinte?.atualizar()
+            abrirDialogo()
+        }
     }
 
     private fun abrirDialogo() {
@@ -847,16 +1024,7 @@ class AssistenteService : Service() {
                     SpeechRecognizer.ERROR_CLIENT -> {
                         if (estava) proximoMotor(error)
                     }
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT, SpeechRecognizer.ERROR_NO_MATCH -> {
-                        silencios++
-                        if (modoConversa && silencios < 3) {
-                            estado("Não ouvi nada, a tentar de novo…", false)
-                            ui.postDelayed({ if (modoConversa && !ouvindo && !ocupado) ouvir() }, 800)
-                        } else {
-                            pararVoz()
-                            estado("Não te ouvi. Toca em 🎤 para tentar de novo.")
-                        }
-                    }
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT, SpeechRecognizer.ERROR_NO_MATCH -> semFala()
                     12, 13 -> {
                         if (idiomaIdx < idiomas.size - 1) {
                             idiomaIdx++
@@ -895,7 +1063,18 @@ class AssistenteService : Service() {
             estado("Falta a permissão do microfone. Abre a app e autoriza.")
             return
         }
-        if (usarDialogo) {
+        if (usarWhisper()) {
+            ouvirWhisper()
+            return
+        }
+        if (sistemaFalhou) {
+            if (!ofertaVista) {
+                ofertaVista = true
+                chatFixo += "ℹ️ A voz do sistema não funciona neste telemóvel. Escreve: descarregar voz " +
+                    "(cerca de ${TranscritorWhisper.TOTAL_MB} MB, usa Wi-Fi) para conversar por voz " +
+                    "mesmo com o ecrã apagado.\n\n"
+                ouvinte?.atualizar()
+            }
             abrirDialogo()
             return
         }
@@ -926,6 +1105,7 @@ class AssistenteService : Service() {
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
         ouvindo = true
+        ouvindoWhisper = false
         escutaPronta = false
         rosto("👂")
         estado("A ouvir… ($lang · ${motores[engIdx]})", false)
