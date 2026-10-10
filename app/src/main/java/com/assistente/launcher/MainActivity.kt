@@ -15,11 +15,13 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
@@ -48,12 +50,21 @@ val MELHOR = Modelo(
     1600
 )
 
+val IDIOMAS = listOf(
+    "pt-PT" to "Português (Portugal)",
+    "pt-BR" to "Português (Brasil)",
+    "en-US" to "English",
+    "es-ES" to "Español",
+    "fr-FR" to "Français"
+)
+
 class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
     private var nomeIA = "Aria"
     private var modeloAtual: Modelo = RAPIDO
     private var pediuPerm = false
+    private var tela = ""
 
     private lateinit var face: TextView
     private lateinit var status: TextView
@@ -70,18 +81,22 @@ class MainActivity : Activity() {
     private fun modelo() = File(filesDir, modeloAtual.arquivo)
     private fun parcial() = File(filesDir, modeloAtual.arquivo + ".tmp")
     private fun modeloOk() = modelo().exists() && modelo().length() > 100_000_000L
+    private fun modeloInstalado(m: Modelo): Boolean {
+        val f = File(filesDir, m.arquivo)
+        return f.exists() && f.length() > 100_000_000L
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         nomeIA = prefs.getString("nome", "Aria") ?: "Aria"
         modeloAtual = if (prefs.getString("modelo", "rapido") == "melhor") MELHOR else RAPIDO
-        if (prefs.getBoolean("configurado", false)) mostrarChat() else mostrarSetup()
+        if (prefs.getBoolean("configurado", false)) mostrarChat() else mostrarConfig(true)
     }
 
     override fun onResume() {
         super.onResume()
         AssistenteService.ouvinte = AssistenteService.Ouvinte { atualizarUi() }
-        if (::chat.isInitialized) {
+        if (tela == "chat" && ::chat.isInitialized) {
             if (AssistenteService.instance == null && modeloOk() &&
                 !prefs.getBoolean("parado", false) && !DownloadService.running
             ) {
@@ -92,6 +107,7 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Componentes comuns ----------
     private fun novoRoot(): LinearLayout {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -111,6 +127,38 @@ class MainActivity : Activity() {
         setPadding(0, dp(6), 0, dp(6))
     }
 
+    private fun titulo(t: String) = texto(t, 22f).apply {
+        gravity = Gravity.CENTER
+        setTypeface(null, Typeface.BOLD)
+    }
+
+    private fun secao(t: String) = texto(t, 16f, "#9FA8FF").apply {
+        setTypeface(null, Typeface.BOLD)
+        setPadding(0, dp(20), 0, dp(4))
+    }
+
+    private fun nota(t: String) = texto(t, 12f, "#9090A8")
+
+    private fun botao(t: String, acao: () -> Unit) = Button(this).apply {
+        text = t
+        isAllCaps = false
+        setOnClickListener { acao() }
+    }
+
+    private fun radios(opcoes: List<String>, marcado: Int): Pair<RadioGroup, List<RadioButton>> {
+        val g = RadioGroup(this)
+        val rbs = opcoes.mapIndexed { i, t ->
+            RadioButton(this).apply {
+                id = View.generateViewId()
+                text = t
+                setTextColor(Color.WHITE)
+                isChecked = (i == marcado)
+            }
+        }
+        rbs.forEach { g.addView(it) }
+        return g to rbs
+    }
+
     private fun ramTotalGb(): Double {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val mi = ActivityManager.MemoryInfo()
@@ -118,29 +166,22 @@ class MainActivity : Activity() {
         return mi.totalMem / 1_000_000_000.0
     }
 
-    // ---------- Ecrã de setup ----------
-    private fun mostrarSetup() {
+    // ---------- Configurações ----------
+    private fun mostrarConfig(primeiraVez: Boolean) {
+        tela = "config"
         ui.removeCallbacks(poll)
+        val s = AssistenteService.instance
+        s?.pararVoz()
         val root = novoRoot()
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
-        col.setPadding(dp(20), dp(24), dp(20), dp(24))
+        col.setPadding(dp(20), dp(20), dp(20), dp(28))
 
-        val ram = ramTotalGb()
-        val tr = prefs.getFloat("tps_rapido", 0f)
-        val tm = prefs.getFloat("tps_melhor", 0f)
-        val recomendado = when {
-            tm > 0f -> if (tm >= 5f) MELHOR else RAPIDO
-            tr >= 15f && ram >= 5.0 -> MELHOR
-            else -> RAPIDO
-        }
-        val jaConfigurado = prefs.getBoolean("configurado", false)
+        col.addView(titulo(if (primeiraVez) "Vamos criar o teu assistente" else "⚙ Configurações"))
 
-        col.addView(texto("Vamos criar o teu assistente", 22f).apply {
-            gravity = Gravity.CENTER
-            setTypeface(null, Typeface.BOLD)
-        })
-        col.addView(texto("Nome do assistente:", 14f, "#A0A0C0"))
+        // Assistente
+        col.addView(secao("Assistente"))
+        col.addView(nota("Nome:"))
         val nomeEdit = EditText(this).apply {
             setText(nomeIA)
             setTextColor(Color.WHITE)
@@ -149,55 +190,299 @@ class MainActivity : Activity() {
         }
         col.addView(nomeEdit)
 
-        col.addView(texto("Modelo de IA:", 14f, "#A0A0C0"))
+        // Idioma
+        col.addView(secao("Idioma da conversa"))
+        val idiomaAtual = prefs.getString("idioma", "pt-PT") ?: "pt-PT"
+        val (gI, rbI) = radios(
+            IDIOMAS.map { it.second },
+            IDIOMAS.indexOfFirst { it.first == idiomaAtual }.coerceAtLeast(0)
+        )
+        col.addView(gI)
+        col.addView(
+            nota(
+                "O idioma muda a voz, o reconhecimento e a língua das respostas da IA. " +
+                    "Os comandos (alarmes, notas…) e os menus estão, por agora, só em português."
+            )
+        )
+
+        // Modelo de IA
+        col.addView(secao("Modelo de IA (o cérebro)"))
+        val ram = ramTotalGb()
+        val tr = prefs.getFloat("tps_rapido", 0f)
+        val tm = prefs.getFloat("tps_melhor", 0f)
+        val recomendado = when {
+            tm > 0f -> if (tm >= 5f) MELHOR else RAPIDO
+            tr >= 15f && ram >= 5.0 -> MELHOR
+            else -> RAPIDO
+        }
         val medido = StringBuilder()
         if (tr > 0f) medido.append("Rápido: ").append(String.format(Locale.US, "%.1f", tr)).append(" tokens/s. ")
         if (tm > 0f) medido.append("Melhor: ").append(String.format(Locale.US, "%.1f", tm)).append(" tokens/s. ")
-        if (medido.isEmpty()) medido.append("Ainda não medi a velocidade deste telemóvel. Começa pelo Rápido.")
+        if (medido.isEmpty()) medido.append("ainda não medida.")
         col.addView(
-            texto(
-                "RAM: cerca de ${String.format(Locale.US, "%.1f", ram)} GB.\nVelocidade medida: $medido\nRecomendado: ${recomendado.titulo}.",
-                13f, "#C0C0E0"
+            nota(
+                "RAM: cerca de ${String.format(Locale.US, "%.1f", ram)} GB. " +
+                    "Velocidade medida: $medido Recomendado: ${recomendado.titulo}."
             )
         )
-        val grupo = RadioGroup(this)
-        val rb1 = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = "${RAPIDO.titulo}, ${RAPIDO.mb} MB. Mais rápido, respostas mais simples."
-            setTextColor(Color.WHITE)
-        }
-        val rb2 = RadioButton(this).apply {
-            id = View.generateViewId()
-            text = "${MELHOR.titulo}, ${MELHOR.mb} MB. Escreve melhor, mas é bem mais lento."
-            setTextColor(Color.WHITE)
-        }
-        grupo.addView(rb1)
-        grupo.addView(rb2)
-        val escolhido = if (jaConfigurado) modeloAtual else recomendado
-        val marcado = if (escolhido.id == "melhor") rb2 else rb1
-        marcado.isChecked = true
-        col.addView(grupo)
+        val modelos = listOf(RAPIDO, MELHOR)
+        val jaConfigurado = prefs.getBoolean("configurado", false)
+        val marcadoM = if (jaConfigurado) (if (modeloAtual.id == "melhor") 1 else 0)
+        else (if (recomendado.id == "melhor") 1 else 0)
+        val (gM, rbM) = radios(
+            modelos.map {
+                "${it.titulo} · ${it.mb} MB · " + if (modeloInstalado(it)) "instalado ✅" else "por descarregar"
+            },
+            marcadoM
+        )
+        col.addView(gM)
+        col.addView(nota("Se escolheres um modelo por descarregar, o botão de download aparece no ecrã principal."))
 
-        col.addView(texto("Podes mudar isto mais tarde.", 12f, "#808098"))
+        val msgTv = nota("")
 
-        val ok = Button(this).apply {
-            text = "Continuar"
-            setOnClickListener {
-                val n = nomeEdit.text.toString().trim().ifEmpty { "Aria" }
-                val m = if (rb2.isChecked) MELHOR else RAPIDO
-                nomeIA = n
-                modeloAtual = m
-                prefs.edit()
-                    .putString("nome", n)
-                    .putString("modelo", m.id)
-                    .putBoolean("configurado", true)
-                    .putBoolean("parado", false)
-                    .apply()
-                stopService(Intent(this@MainActivity, AssistenteService::class.java))
-                mostrarChat()
+        // Voz
+        col.addView(secao("Voz"))
+        val infoTv = texto(
+            s?.infoVoz() ?: "Acorda a Aria (ecrã principal) para ver o estado da voz.",
+            12f, "#C0C0E0"
+        )
+        col.addView(infoTv)
+
+        col.addView(texto("Ouvidos (reconhecimento de voz)", 14f, "#FFFFFF").apply {
+            setTypeface(null, Typeface.BOLD)
+        })
+        val varAtual = prefs.getString("whisper_var", "base") ?: "base"
+        val wB = TranscritorWhisper(applicationContext).also { it.variante = "base" }
+        val wS = TranscritorWhisper(applicationContext).also { it.variante = "small" }
+        val (gV, rbV) = radios(
+            listOf(
+                "Base · 160 MB · rápida, boa precisão · " + if (wB.instalado()) "instalada ✅" else "por descarregar",
+                "Small · 375 MB · mais precisa, mais lenta · " + if (wS.instalado()) "instalada ✅" else "por descarregar"
+            ),
+            if (varAtual == "small") 1 else 0
+        )
+        col.addView(gV)
+        val chkProp = CheckBox(this).apply {
+            text = "Preferir a voz própria (100% offline)"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.getBoolean("whisper_pref", false)
+        }
+        col.addView(chkProp)
+        col.addView(botao("⬇ Descarregar a voz própria escolhida") {
+            if (s == null) {
+                msgTv.text = "A Aria está a dormir. Volta ao ecrã principal e toca em Acordar."
+                return@botao
+            }
+            val v = if (rbV[1].isChecked) "small" else "base"
+            prefs.edit().putString("whisper_var", v).apply()
+            s.recarregarConfig()
+            msgTv.text = s.iniciarDownloadVoz()
+        })
+        col.addView(botao("🔁 Tentar a voz do sistema outra vez") {
+            if (s == null) {
+                msgTv.text = "A Aria está a dormir. Volta ao ecrã principal e toca em Acordar."
+                return@botao
+            }
+            s.tentarSistemaOutraVez()
+            msgTv.text = "Combinado. Toca em 🎤 no ecrã principal para testar."
+        })
+
+        col.addView(texto("Boca (voz de resposta)", 14f, "#FFFFFF").apply {
+            setTypeface(null, Typeface.BOLD)
+        })
+        col.addView(botao("🔊 Testar a voz") {
+            if (s == null) {
+                msgTv.text = "A Aria está a dormir. Volta ao ecrã principal e toca em Acordar."
+                return@botao
+            }
+            s.testarVoz()
+            msgTv.text = "A tocar a frase de teste. Se não ouvires nada, usa os botões abaixo."
+        })
+        col.addView(botao("⚙ Abrir definições de voz do telemóvel") {
+            try {
+                startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+            } catch (e: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_SETTINGS))
+                } catch (_: Exception) {
+                    msgTv.text = "Não consegui abrir as definições."
+                }
+            }
+        })
+        col.addView(botao("⬇ Instalar dados de voz") {
+            try {
+                startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA))
+            } catch (e: Exception) {
+                msgTv.text = "Este telemóvel não tem instalador de dados de voz. " +
+                    "Usa as definições de voz e escolhe o motor da Google."
+            }
+        })
+        col.addView(msgTv)
+
+        // Guardar / cancelar
+        col.addView(botao(if (primeiraVez) "Continuar" else "Guardar") {
+            val nomeNovo = nomeEdit.text.toString().trim().ifEmpty { "Aria" }
+            val idiomaNovo = IDIOMAS[rbI.indexOfFirst { it.isChecked }.coerceAtLeast(0)].first
+            val modeloNovo = if (rbM[1].isChecked) MELHOR else RAPIDO
+            val varNova = if (rbV[1].isChecked) "small" else "base"
+            val mudouServico = modeloNovo.id != modeloAtual.id || nomeNovo != nomeIA
+            prefs.edit()
+                .putString("nome", nomeNovo)
+                .putString("idioma", idiomaNovo)
+                .putString("modelo", modeloNovo.id)
+                .putString("whisper_var", varNova)
+                .putBoolean("whisper_pref", chkProp.isChecked)
+                .putBoolean("configurado", true)
+                .putBoolean("parado", false)
+                .apply()
+            nomeIA = nomeNovo
+            modeloAtual = modeloNovo
+            mostrarChat()
+            if (!primeiraVez && mudouServico) {
+                reiniciarServico()
+            } else {
+                AssistenteService.instance?.recarregarConfig()
+            }
+        })
+        if (!primeiraVez) col.addView(botao("Cancelar") { mostrarChat() })
+
+        root.addView(
+            ScrollView(this).apply { addView(col) },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        setContentView(root)
+    }
+
+    private fun reiniciarServico() {
+        stopService(Intent(this, AssistenteService::class.java))
+        var tentativas = 0
+        val r = object : Runnable {
+            override fun run() {
+                if (AssistenteService.instance == null) {
+                    if (modeloOk()) garantirServico() else iniciar()
+                } else if (tentativas++ < 20) {
+                    ui.postDelayed(this, 250)
+                }
             }
         }
-        col.addView(ok)
+        ui.postDelayed(r, 300)
+    }
+
+    // ---------- Ajuda ----------
+    private fun mostrarInfo() {
+        tela = "info"
+        ui.removeCallbacks(poll)
+        AssistenteService.instance?.pararVoz()
+        val root = novoRoot()
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(20), dp(20), dp(20), dp(28))
+
+        col.addView(titulo("ℹ Ajuda: o que a $nomeIA faz"))
+        col.addView(
+            texto(
+                "A $nomeIA é um assistente de IA que vive no teu telemóvel e também serve de ecrã inicial. " +
+                    "Funciona offline: o “cérebro” é descarregado uma vez e depois não precisa de internet.",
+                14f
+            )
+        )
+
+        col.addView(secao("Como falar com ela"))
+        col.addView(
+            texto(
+                "• Texto: escreve e toca em Enviar.\n" +
+                    "• 🎤: toca, espera o bip e fala. Toca outra vez para terminar mais cedo.\n" +
+                    "• 🎧 Modo conversa: ela ouve, responde em voz alta e volta a ouvir sozinha. " +
+                    "Pára depois de 3 silêncios seguidos.\n" +
+                    "• Ecrã apagado: a notificação “${nomeIA} ativa” tem os botões 🎤 Falar e ⏹ Parar. " +
+                    "O botão do auricular também tenta ativá-la, mas depende do telemóvel.",
+                14f
+            )
+        )
+
+        col.addView(secao("O que já faz (resposta imediata, sem IA)"))
+        col.addView(
+            texto(
+                "• Horas e data: “Que horas são?”, “Que dia é hoje?”\n" +
+                    "• Notas: “Anota comprar pão”, “Lê as minhas notas”\n" +
+                    "• Lembretes: “Lembra-me daqui a 20 minutos de ligar à mãe”, " +
+                    "“Lembra-me às 18:00 de levantar a encomenda”. A $nomeIA diz o lembrete em voz alta.\n" +
+                    "• Alarmes: “Põe um alarme às 7 e meia”\n" +
+                    "• Temporizadores: “Temporizador de 10 minutos”\n" +
+                    "• Gerir: “Que alarmes tenho?”, “Cancela os alarmes”\n" +
+                    "• Conversa livre: tudo o resto vai para a IA.",
+                14f
+            )
+        )
+
+        col.addView(secao("Comandos sobre a voz"))
+        col.addView(
+            texto(
+                "• “descarregar voz”: descarrega a voz própria (Whisper).\n" +
+                    "• “usar voz própria” e “usar voz do sistema”\n" +
+                    "• “estado da voz”",
+                14f
+            )
+        )
+
+        col.addView(secao("Modelos de IA"))
+        col.addView(
+            texto(
+                "• Rápido (0,5B): mais leve e veloz, respostas mais simples.\n" +
+                    "• Melhor (1,5B): escreve melhor, mas é bem mais lento e pesa na memória.\n" +
+                    "Em ⚙ Configurações vês a velocidade medida no teu telemóvel e podes trocar de modelo.",
+                14f
+            )
+        )
+
+        col.addView(secao("Voz: ouvidos e boca"))
+        col.addView(
+            texto(
+                "• Ouvidos: a voz do sistema (Android/Google/Samsung), que depende do telemóvel, ou a voz própria " +
+                    "(Whisper), que é independente e 100% offline. Base é mais rápida; Small é mais precisa.\n" +
+                    "• Boca: a voz de resposta vem do telemóvel. Se faltar o português, instala os dados de voz em " +
+                    "⚙ Configurações → Voz.",
+                14f
+            )
+        )
+
+        col.addView(secao("Privacidade"))
+        col.addView(
+            texto(
+                "• Conversas, notas e lembretes ficam no telemóvel.\n" +
+                    "• A internet só é usada para descarregar modelos, quando pedes.\n" +
+                    "• A voz do sistema é fornecida pelo Android e pode usar a rede. A voz própria não usa.",
+                14f
+            )
+        )
+
+        col.addView(secao("Ainda não faz (em desenvolvimento)"))
+        col.addView(
+            texto(
+                "• Ligar, enviar mensagens, tocar música e GPS.\n" +
+                    "• Modo online com interruptor.\n" +
+                    "• Personagem personalizável (aparência e voz).\n" +
+                    "• Chamar por “Ei ${nomeIA}” sem tocar em nada.",
+                14f
+            )
+        )
+
+        col.addView(secao("Bom saber"))
+        col.addView(
+            texto(
+                "• O modelo pequeno pode errar ou misturar palavras. O Melhor é mais capaz, mas mais lento.\n" +
+                    "• Alarmes e lembretes vivem na app e não aparecem na app Relógio.\n" +
+                    "• Enquanto a $nomeIA está ativa, o modelo fica na memória. ⏹ Parar liberta-a.\n" +
+                    "• Em algumas marcas é preciso permitir a app “sem restrições de bateria”.\n" +
+                    "• Os menus e comandos estão por agora só em português.",
+                14f
+            )
+        )
+
+        col.addView(botao("Voltar") { mostrarChat() })
 
         root.addView(
             ScrollView(this).apply { addView(col) },
@@ -211,6 +496,7 @@ class MainActivity : Activity() {
 
     // ---------- Ecrã de chat ----------
     private fun mostrarChat() {
+        tela = "chat"
         val root = novoRoot()
 
         face = TextView(this).apply {
@@ -224,11 +510,17 @@ class MainActivity : Activity() {
             textSize = 13f; setTextColor(Color.parseColor("#A0A0C0"))
             gravity = Gravity.CENTER; setPadding(dp(16), dp(4), dp(16), dp(4))
         }
-        val cfg = TextView(this).apply {
-            text = "⚙ Mudar nome ou modelo"; textSize = 12f
-            setTextColor(Color.parseColor("#7C7CFF"))
-            gravity = Gravity.CENTER; setPadding(dp(8), dp(4), dp(8), dp(8))
-            setOnClickListener { abrirSetup() }
+        val barra = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), 0, dp(8), 0)
+            addView(
+                botao("⚙ Configurações") { mostrarConfig(false) },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(
+                botao("ℹ Ajuda") { mostrarInfo() },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
         }
         conversaBtn = Button(this).apply {
             text = "🎧 Modo conversa: desligado"
@@ -280,7 +572,7 @@ class MainActivity : Activity() {
         root.addView(face, LinearLayout.LayoutParams(match, wrap))
         root.addView(nome, LinearLayout.LayoutParams(match, wrap))
         root.addView(status, LinearLayout.LayoutParams(match, wrap))
-        root.addView(cfg, LinearLayout.LayoutParams(match, wrap))
+        root.addView(barra, LinearLayout.LayoutParams(match, wrap))
         root.addView(conversaBtn, LinearLayout.LayoutParams(match, wrap))
         root.addView(acordarBtn, LinearLayout.LayoutParams(match, wrap))
         root.addView(downloadBtn, LinearLayout.LayoutParams(match, wrap))
@@ -291,19 +583,9 @@ class MainActivity : Activity() {
         iniciar()
     }
 
-    private fun abrirSetup() {
-        val s = AssistenteService.instance
-        if (DownloadService.running || (s != null && (!s.pronto || s.ocupado))) {
-            status.text = "Espera um momento (a IA está ocupada ou a descarregar)."
-            return
-        }
-        s?.pararVoz()
-        mostrarSetup()
-    }
-
     // ---------- Estado vindo do serviço ----------
     private fun atualizarUi() {
-        if (!::chat.isInitialized) return
+        if (tela != "chat" || !::chat.isInitialized) return
         val s = AssistenteService.instance
         if (s == null) {
             if (prefs.getBoolean("parado", false) && modeloOk()) {
@@ -341,7 +623,7 @@ class MainActivity : Activity() {
         s.enviarTexto(txt)
     }
 
-    // ---------- Download do modelo ----------
+    // ---------- Download do modelo de IA ----------
     private fun textoBotao(): String {
         val mb = if (parcial().exists()) parcial().length() / 1_000_000 else 0L
         return if (mb > 0) "Continuar de onde parou" else "Descarregar IA (~${modeloAtual.mb} MB)"
@@ -349,6 +631,7 @@ class MainActivity : Activity() {
 
     private val poll = object : Runnable {
         override fun run() {
+            if (tela != "chat") return
             if (modeloOk()) {
                 garantirServico()
                 return
@@ -419,6 +702,7 @@ class MainActivity : Activity() {
             atualizarUi()
             return
         }
+        if (tela != "chat" || !::status.isInitialized) return
         val faltam = mutableListOf<String>()
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             faltam.add(Manifest.permission.RECORD_AUDIO)
@@ -477,7 +761,13 @@ class MainActivity : Activity() {
     }
 
     @Deprecated("Launcher não deve fechar com Voltar")
-    override fun onBackPressed() {}
+    override fun onBackPressed() {
+        if (tela == "info") {
+            mostrarChat()
+        } else if (tela == "config" && prefs.getBoolean("configurado", false)) {
+            mostrarChat()
+        }
+    }
 
     override fun onDestroy() {
         ui.removeCallbacks(poll)
