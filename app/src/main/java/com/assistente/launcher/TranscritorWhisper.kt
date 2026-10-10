@@ -18,25 +18,43 @@ import kotlin.math.sqrt
 
 class TranscritorWhisper(private val ctx: Context) {
 
-    companion object {
-        private const val BASE =
-            "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/"
-        val ARQUIVOS = listOf(
-            "base-encoder.int8.onnx",
-            "base-decoder.int8.onnx",
-            "base-tokens.txt"
-        )
-        const val TOTAL_MB = 160
-    }
+    // "base" ou "small"
+    var variante: String = "base"
+        set(v) {
+            if (v != field) {
+                field = v
+                liberar()
+            }
+        }
+
+    // código curto do idioma: pt, en, es, fr
+    var idioma: String = "pt"
+        set(v) {
+            if (v != field) {
+                field = v
+                liberar()
+            }
+        }
 
     @Volatile private var rec: OfflineRecognizer? = null
     @Volatile private var terminarJaFlag = false
     @Volatile var gravando = false
         private set
 
-    fun pasta() = File(ctx.filesDir, "whisper_base")
+    fun arquivos() = listOf(
+        "$variante-encoder.int8.onnx",
+        "$variante-decoder.int8.onnx",
+        "$variante-tokens.txt"
+    )
 
-    fun instalado(): Boolean = ARQUIVOS.all {
+    fun totalMb() = if (variante == "small") 375 else 160
+
+    private fun urlBase() =
+        "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-$variante/resolve/main/"
+
+    fun pasta() = File(ctx.filesDir, "whisper_$variante")
+
+    fun instalado(): Boolean = arquivos().all {
         val f = File(pasta(), it)
         f.exists() && f.length() > 100_000L
     }
@@ -44,13 +62,14 @@ class TranscritorWhisper(private val ctx: Context) {
     // ---------- Download (com retoma) ----------
     fun baixarTudo(progresso: (Int, Int, Int) -> Unit) {
         pasta().mkdirs()
-        ARQUIVOS.forEachIndexed { i, nome ->
+        val lista = arquivos()
+        lista.forEachIndexed { i, nome ->
             val destino = File(pasta(), nome)
             if (!(destino.exists() && destino.length() > 100_000L)) {
                 var falhas = 0
                 while (true) {
                     try {
-                        baixarUm(BASE + nome, destino) { pct -> progresso(i + 1, ARQUIVOS.size, pct) }
+                        baixarUm(urlBase() + nome, destino) { pct -> progresso(i + 1, lista.size, pct) }
                         break
                     } catch (e: Exception) {
                         falhas++
@@ -113,16 +132,17 @@ class TranscritorWhisper(private val ctx: Context) {
     private fun carregar(): OfflineRecognizer {
         rec?.let { return it }
         val d = pasta()
+        val a = arquivos()
         val cfg = OfflineRecognizerConfig(
             featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
             modelConfig = OfflineModelConfig(
                 whisper = OfflineWhisperModelConfig(
-                    encoder = File(d, ARQUIVOS[0]).absolutePath,
-                    decoder = File(d, ARQUIVOS[1]).absolutePath,
-                    language = "pt",
+                    encoder = File(d, a[0]).absolutePath,
+                    decoder = File(d, a[1]).absolutePath,
+                    language = idioma,
                     task = "transcribe"
                 ),
-                tokens = File(d, ARQUIVOS[2]).absolutePath,
+                tokens = File(d, a[2]).absolutePath,
                 numThreads = 2,
                 debug = false,
                 provider = "cpu",
