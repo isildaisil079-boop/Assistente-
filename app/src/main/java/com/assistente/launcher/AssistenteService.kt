@@ -51,6 +51,7 @@ class AssistenteService : Service() {
         const val CANAL = "assistente"
         const val GOOGLE_PKG = "com.google.android.googlequicksearchbox"
         const val GOOGLE_SVC = "com.google.android.voicesearch.serviceapi.GoogleRecognitionService"
+        const val GOOGLE_TTS = "com.google.android.tts"
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -75,6 +76,7 @@ class AssistenteService : Service() {
 
     private var iniciado = false
     private var nomeIA = "Aria"
+    private var idioma = "pt-PT"
     private var modeloAtual: Modelo = RAPIDO
     private var llm: LlmInference? = null
     private val history = mutableListOf<Pair<String, String>>()
@@ -98,10 +100,19 @@ class AssistenteService : Service() {
     private var statsTxt = ""
     private var sttTxt = ""
 
-    // voz
-    private var recognizer: SpeechRecognizer? = null
+    // voz: boca (síntese)
     private var tts: TextToSpeech? = null
     private var ttsPronto = false
+    private var ttsGeracao = 0
+    private val ttsFila = ArrayDeque<String>()
+    private val ttsTentados = mutableSetOf<String>()
+    private var ttsDiag = ""
+    private var ttsFalha = ""
+    private var ttsMotorEmUso = ""
+    private var ttsIdiomaEmUso = ""
+
+    // voz: ouvidos (reconhecimento)
+    private var recognizer: SpeechRecognizer? = null
     @Volatile private var ouvindo = false
     @Volatile private var idEscuta = 0
     private var ouvindoWhisper = false
@@ -109,7 +120,7 @@ class AssistenteService : Service() {
     private var silencios = 0
     private var tentativas = 0
     private var ultimoErro = 0
-    private val idiomas = listOf("pt-BR", "pt-PT", "pt")
+    private var idiomas = listOf("pt-PT", "pt-BR", "pt")
     private var idiomaIdx = 0
     private val motores = listOf("no aparelho", "sistema", "Google")
     private var engIdx = 0
@@ -163,6 +174,7 @@ class AssistenteService : Service() {
         instance = null
         pronto = false
         idEscuta++
+        ttsGeracao++
         ui.removeCallbacksAndMessages(null)
         try { recognizer?.destroy() } catch (_: Throwable) {}
         try { tts?.shutdown() } catch (_: Throwable) {}
@@ -232,16 +244,94 @@ class AssistenteService : Service() {
         ouvinte?.atualizar()
     }
 
-    // ---------- Configuração e modelo ----------
+    // ---------- Configuração ----------
+    private fun listaIdiomas(tag: String): List<String> = when (tag) {
+        "pt-PT" -> listOf("pt-PT", "pt-BR", "pt")
+        "pt-BR" -> listOf("pt-BR", "pt-PT", "pt")
+        "en-US" -> listOf("en-US", "en-GB", "en")
+        "es-ES" -> listOf("es-ES", "es-US", "es")
+        "fr-FR" -> listOf("fr-FR", "fr-CA", "fr")
+        else -> listOf(tag)
+    }
+
+    private fun idiomaNoPrompt() = when (idioma) {
+        "pt-PT" -> "português de Portugal"
+        "pt-BR" -> "português do Brasil"
+        "en-US" -> "English"
+        "es-ES" -> "español"
+        "fr-FR" -> "français"
+        else -> "português"
+    }
+
     private fun lerConfig() {
         nomeIA = prefs.getString("nome", "Aria") ?: "Aria"
         modeloAtual = if (prefs.getString("modelo", "rapido") == "melhor") MELHOR else RAPIDO
-        idiomaIdx = prefs.getInt("stt_idioma", 0).coerceIn(0, idiomas.size - 1)
+        idioma = prefs.getString("idioma", "pt-PT") ?: "pt-PT"
+        idiomas = listaIdiomas(idioma)
+        val salvo = prefs.getString("stt_lang", "") ?: ""
+        idiomaIdx = idiomas.indexOf(salvo).let { if (it < 0) 0 else it }
         val padrao = if (prefs.getBoolean("stt_ondevice", true)) 0 else 1
         engIdx = prefs.getInt("stt_motor", padrao).coerceIn(0, motores.size - 1)
         sistemaFalhou = prefs.getLong("sistema_falhou", -1L) == versaoApp()
+        whisper.variante = prefs.getString("whisper_var", "base") ?: "base"
+        whisper.idioma = idioma.substringBefore('-')
     }
 
+    // Aplica idioma, variante da voz própria e preferências sem reiniciar o modelo de IA
+    fun recarregarConfig() {
+        val anterior = idioma
+        idioma = prefs.getString("idioma", "pt-PT") ?: "pt-PT"
+        idiomas = listaIdiomas(idioma)
+        idiomaIdx = 0
+        whisper.variante = prefs.getString("whisper_var", "base") ?: "base"
+        whisper.idioma = idioma.substringBefore('-')
+        try { recognizer?.destroy() } catch (_: Throwable) {}
+        recognizer = null
+        if (idioma != anterior) {
+            resetSessao()
+            history.clear()
+        }
+        iniciarTts()
+        estado(pronta())
+    }
+
+    fun tentarSistemaOutraVez() {
+        prefs.edit().putBoolean("whisper_pref", false).putLong("sistema_falhou", -1L).apply()
+        sistemaFalhou = false
+        engIdx = 0
+        idiomaIdx = 0
+        estado("Vou tentar a voz do sistema na próxima vez que tocares em 🎤.")
+    }
+
+    fun infoVoz(): String {
+        val v = whisper.variante.replaceFirstChar { it.uppercase() }
+        val sis = if (sistemaFalhou) "voz do sistema indisponível" else "voz do sistema por testar ou a funcionar"
+        val prop = when {
+            !whisper.instalado() -> "voz própria $v não instalada"
+            usarWhisper() -> "voz própria $v instalada e em uso"
+            else -> "voz própria $v instalada"
+        }
+        val boca = if (ttsPronto) "$ttsMotorEmUso ($ttsIdiomaEmUso)" else "indisponível. $ttsFalha"
+        return "Ouvidos: $sis; $prop.\nBoca: $boca"
+    }
+
+    fun testarVoz() {
+        val t = tts
+        if (t == null || !ttsPronto) {
+            estado("Voz de resposta indisponível. $ttsFalha")
+            return
+        }
+        val frase = when (idioma) {
+            "en-US" -> "Hello! I am $nomeIA. I am talking to you."
+            "es-ES" -> "¡Hola! Soy $nomeIA. Te estoy hablando."
+            "fr-FR" -> "Bonjour ! Je suis $nomeIA. Je te parle."
+            else -> "Olá! Eu sou a $nomeIA. Estou a falar contigo."
+        }
+        uttCount++
+        t.speak(frase, TextToSpeech.QUEUE_FLUSH, null, "teste$uttCount")
+    }
+
+    // ---------- Modelo de IA ----------
     private fun carregarModelo() {
         val f = File(filesDir, modeloAtual.arquivo)
         if (!f.exists()) {
@@ -335,7 +425,7 @@ class AssistenteService : Service() {
     private fun promptNovo(msg: String): String {
         val sb = StringBuilder()
         sb.append("<|im_start|>system\nTu és $nomeIA, amigo e assistente do utilizador. ")
-        sb.append("Responde em português de Portugal, em frases curtas e corretas, sem emojis.<|im_end|>\n")
+        sb.append("Responde em ${idiomaNoPrompt()}, em frases curtas e corretas, sem emojis.<|im_end|>\n")
         history.takeLast(4).forEach { (r, t) ->
             sb.append("<|im_start|>$r\n${t.take(200)}<|im_end|>\n")
         }
@@ -546,7 +636,7 @@ class AssistenteService : Service() {
         ocupado = false
         if (voz) {
             falarFrases(resposta, true)
-            if (!ttsPronto) estado("Voz em português não disponível no telemóvel.")
+            if (!ttsPronto) estado("Voz de resposta indisponível. Abre ⚙ Configurações → Voz.")
             if (falasPend == 0) depoisDeFalar()
         } else {
             rosto("🙂")
@@ -649,7 +739,7 @@ class AssistenteService : Service() {
 
         if (vozAtiva) {
             falarFrases(limpo, true)
-            if (!ttsPronto) estado("Voz em português não disponível no telemóvel.")
+            if (!ttsPronto) estado("Voz de resposta indisponível. Abre ⚙ Configurações → Voz.")
             if (falasPend == 0) depoisDeFalar()
         } else {
             rosto("🙂")
@@ -669,28 +759,93 @@ class AssistenteService : Service() {
         estado(pronta())
     }
 
-    // ---------- Voz: falar (frase a frase) ----------
+    // ---------- Voz: falar (testa todos os motores de síntese instalados) ----------
     private fun iniciarTts() {
-        tts = TextToSpeech(this) { st ->
-            if (st == TextToSpeech.SUCCESS) {
-                tts?.let { t ->
-                    var r = t.setLanguage(Locale("pt", "PT"))
-                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        r = t.setLanguage(Locale("pt", "BR"))
-                    }
-                    ttsPronto = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
-                    t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                        override fun onStart(utteranceId: String?) {}
-                        override fun onDone(utteranceId: String?) {
-                            ui.post { falaTerminou() }
-                        }
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(utteranceId: String?) {
-                            ui.post { falaTerminou() }
-                        }
-                    })
-                }
+        ttsGeracao++
+        ttsPronto = false
+        ttsFila.clear()
+        ttsTentados.clear()
+        ttsDiag = ""
+        ttsFalha = ""
+        val motores = try {
+            packageManager.queryIntentServices(
+                Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0
+            ).map { it.serviceInfo.packageName }.distinct()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        ttsFila.addAll(motores.sortedBy { if (it == GOOGLE_TTS) 0 else 1 })
+        abrirTts(null)
+    }
+
+    private fun abrirTts(motor: String?) {
+        ttsPronto = false
+        val ger = ttsGeracao
+        try { tts?.shutdown() } catch (_: Throwable) {}
+        tts = null
+        val listener = TextToSpeech.OnInitListener { st -> ui.post { aoAbrirTts(st, motor, ger) } }
+        tts = try {
+            if (motor == null) TextToSpeech(this, listener) else TextToSpeech(this, listener, motor)
+        } catch (e: Throwable) {
+            ttsDiag += "${motor ?: "padrão"}: erro ao criar; "
+            null
+        }
+        if (tts == null) proximoMotorTts()
+    }
+
+    private fun aoAbrirTts(st: Int, motor: String?, ger: Int) {
+        if (ger != ttsGeracao || !iniciado) return
+        val t = tts ?: return
+        val nome = motor ?: (try { t.defaultEngine } catch (_: Throwable) { null }) ?: "padrão"
+        ttsTentados.add(nome)
+        if (st != TextToSpeech.SUCCESS) {
+            ttsDiag += "$nome: não iniciou; "
+            proximoMotorTts()
+            return
+        }
+        var usado: String? = null
+        for (tag in idiomas) {
+            val l = Locale.forLanguageTag(tag)
+            val r = try { t.setLanguage(l) } catch (_: Throwable) { TextToSpeech.ERROR }
+            if (r >= TextToSpeech.LANG_AVAILABLE) {
+                usado = tag
+                break
             }
+            ttsDiag += "$nome $tag=$r; "
+        }
+        if (usado == null) {
+            proximoMotorTts()
+            return
+        }
+        ttsPronto = true
+        ttsFalha = ""
+        ttsMotorEmUso = nome
+        ttsIdiomaEmUso = usado
+        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                ui.post { falaTerminou() }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                ui.post { falaTerminou() }
+            }
+        })
+        ouvinte?.atualizar()
+    }
+
+    private fun proximoMotorTts() {
+        var prox = ttsFila.removeFirstOrNull()
+        while (prox != null && prox in ttsTentados) prox = ttsFila.removeFirstOrNull()
+        if (prox != null) {
+            abrirTts(prox)
+            return
+        }
+        ttsPronto = false
+        ttsFalha = "Nenhum motor de voz tem o idioma $idioma. Testado: ${ttsDiag.trim()}"
+        if (iniciado) {
+            chatFixo += "ℹ️ $ttsFalha. Abre ⚙ Configurações → Voz para instalar os dados de voz.\n\n"
+            ouvinte?.atualizar()
         }
     }
 
@@ -740,10 +895,7 @@ class AssistenteService : Service() {
         if (t.length > 60 || !Regex("""\bvoz\b""").containsMatchIn(t)) return null
         if (Regex("""\b(descarreg\w*|instal\w*)\b""").containsMatchIn(t)) return iniciarDownloadVoz()
         if (Regex("""\b(usar|usa|ativar|ativa|muda|mudar)\b.*\bsistema\b""").containsMatchIn(t)) {
-            prefs.edit().putBoolean("whisper_pref", false).putLong("sistema_falhou", -1L).apply()
-            sistemaFalhou = false
-            engIdx = 0
-            idiomaIdx = 0
+            tentarSistemaOutraVez()
             return "Combinado. Vou tentar a voz do sistema."
         }
         if (Regex("""\b(usar|usa|ativar|ativa)\b.*\bpropria\b""").containsMatchIn(t)) {
@@ -763,11 +915,11 @@ class AssistenteService : Service() {
         return null
     }
 
-    private fun iniciarDownloadVoz(): String {
+    fun iniciarDownloadVoz(): String {
         if (whisper.instalado()) return "A voz própria já está instalada."
         if (baixandoVoz) return "Já estou a descarregar a voz própria."
         descarregarVoz()
-        return "Combinado. A descarregar a voz própria, cerca de ${TranscritorWhisper.TOTAL_MB} MB. " +
+        return "Combinado. A descarregar a voz própria, cerca de ${whisper.totalMb()} MB. " +
             "Podes bloquear o ecrã. Aviso quando terminar."
     }
 
@@ -942,7 +1094,7 @@ class AssistenteService : Service() {
             chatFixo += "ℹ️ Voz do sistema indisponível ($resumo; $google; serviços: " +
                 "${if (servicos.isEmpty()) "nenhum" else servicos}). Para conversar por voz com o ecrã " +
                 "apagado e com mais fiabilidade, escreve: descarregar voz (cerca de " +
-                "${TranscritorWhisper.TOTAL_MB} MB, usa Wi-Fi). Entretanto uso o ditado do sistema.\n\n"
+                "${whisper.totalMb()} MB, usa Wi-Fi). Entretanto uso o ditado do sistema.\n\n"
             ouvinte?.atualizar()
             abrirDialogo()
         }
@@ -1006,7 +1158,7 @@ class AssistenteService : Service() {
                     tentativas = 0
                     falhas.setLength(0)
                     prefs.edit()
-                        .putInt("stt_idioma", idiomaIdx)
+                        .putString("stt_lang", idiomas[idiomaIdx.coerceIn(0, idiomas.size - 1)])
                         .putInt("stt_motor", engIdx)
                         .apply()
                     processar(txt, true)
@@ -1071,7 +1223,7 @@ class AssistenteService : Service() {
             if (!ofertaVista) {
                 ofertaVista = true
                 chatFixo += "ℹ️ A voz do sistema não funciona neste telemóvel. Escreve: descarregar voz " +
-                    "(cerca de ${TranscritorWhisper.TOTAL_MB} MB, usa Wi-Fi) para conversar por voz " +
+                    "(cerca de ${whisper.totalMb()} MB, usa Wi-Fi) para conversar por voz " +
                     "mesmo com o ecrã apagado.\n\n"
                 ouvinte?.atualizar()
             }
@@ -1097,7 +1249,7 @@ class AssistenteService : Service() {
         val r: SpeechRecognizer = tmp
         recognizer = r
 
-        val lang = idiomas[idiomaIdx]
+        val lang = idiomas[idiomaIdx.coerceIn(0, idiomas.size - 1)]
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
