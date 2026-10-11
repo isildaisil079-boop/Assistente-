@@ -16,7 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.ContactsContract
+import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.MediaStore
 import android.provider.Settings
 import android.telecom.TelecomManager
@@ -151,15 +151,14 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
         if (q.isEmpty()) return emptyList()
         val qJunto = q.joinToString(" ")
         val mapa = LinkedHashMap<String, Pair<Contacto, Int>>()
-        val phone = ContactsContract.CommonDataKinds.Phone
         ctx.contentResolver.query(
-            phone.CONTENT_URI,
-            arrayOf(phone.DISPLAY_NAME, phone.NUMBER, phone.TYPE),
+            Phone.CONTENT_URI,
+            arrayOf(Phone.DISPLAY_NAME, Phone.NUMBER, Phone.TYPE),
             null, null, null
         )?.use { c ->
-            val iN = c.getColumnIndex(phone.DISPLAY_NAME)
-            val iP = c.getColumnIndex(phone.NUMBER)
-            val iT = c.getColumnIndex(phone.TYPE)
+            val iN = c.getColumnIndex(Phone.DISPLAY_NAME)
+            val iP = c.getColumnIndex(Phone.NUMBER)
+            val iT = c.getColumnIndex(Phone.TYPE)
             while (c.moveToNext()) {
                 val nome = c.getString(iN) ?: continue
                 val num = c.getString(iP) ?: continue
@@ -168,7 +167,7 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
                 val tokens = nn.split(" ")
                 if (!q.all { qt -> tokens.any { it.startsWith(qt) } }) continue
                 val atual = mapa[nn]
-                if (atual == null || (atual.second != phone.TYPE_MOBILE && tipo == phone.TYPE_MOBILE)) {
+                if (atual == null || (atual.second != Phone.TYPE_MOBILE && tipo == Phone.TYPE_MOBILE)) {
                     mapa[nn] = Contacto(nome, num) to tipo
                 }
             }
