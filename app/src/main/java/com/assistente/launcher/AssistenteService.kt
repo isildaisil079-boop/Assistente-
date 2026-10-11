@@ -46,6 +46,7 @@ class AssistenteService : Service() {
     companion object {
         @Volatile var instance: AssistenteService? = null
         @Volatile var ouvinte: Ouvinte? = null
+        @Volatile var appVisivel = false
         const val ACAO_FALAR = "com.assistente.launcher.FALAR"
         const val ACAO_PARAR = "com.assistente.launcher.PARAR"
         const val CANAL = "assistente"
@@ -57,6 +58,7 @@ class AssistenteService : Service() {
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
     private val whisper by lazy { TranscritorWhisper(applicationContext) }
+    private val telefone by lazy { AcoesTelefone(applicationContext, this) }
 
     // estado visível pela app
     var estadoTxt = "A iniciar…"
@@ -291,6 +293,7 @@ class AssistenteService : Service() {
             resetSessao()
             history.clear()
         }
+        retomarSessaoMidia()
         iniciarTts()
         estado(pronta())
     }
@@ -329,6 +332,15 @@ class AssistenteService : Service() {
         }
         uttCount++
         t.speak(frase, TextToSpeech.QUEUE_FLUSH, null, "teste$uttCount")
+    }
+
+    // ---------- Sessão de média (botão do auricular) ----------
+    fun suspenderSessaoMidia() {
+        try { sessaoMidia?.isActive = false } catch (_: Throwable) {}
+    }
+
+    fun retomarSessaoMidia() {
+        try { sessaoMidia?.isActive = prefs.getBoolean("auricular", true) } catch (_: Throwable) {}
     }
 
     // ---------- Modelo de IA ----------
@@ -544,6 +556,7 @@ class AssistenteService : Service() {
         idEscuta++
         vozAtiva = false
         falasPend = 0
+        telefone.consumirAguarda()
         ui.removeCallbacks(timeoutEscuta)
         try { recognizer?.cancel() } catch (_: Throwable) {}
         try { tts?.stop() } catch (_: Throwable) {}
@@ -605,20 +618,31 @@ class AssistenteService : Service() {
         }
     }
 
-    // Primeiro os comandos de voz, depois as ações (alarmes, notas, horas…), por fim a IA.
+    // Ordem: confirmação pendente, comandos de voz, ações (alarmes, notas…),
+    // chamadas/mensagens/música, e por fim a IA.
     private fun processar(txt: String, voz: Boolean) {
         if (ocupado) return
+        val pend = try { telefone.resolverPendente(txt) } catch (e: Throwable) { null }
+        if (pend != null) {
+            responderDireto(txt, pend, voz)
+            return
+        }
         val cmd = try { comandoVoz(txt) } catch (e: Throwable) { null }
         if (cmd != null) {
             responderDireto(txt, cmd, voz)
             return
         }
         val r = try { Acoes.tentar(this, txt) } catch (e: Throwable) { null }
-        if (r == null) {
-            processarLLM(txt, voz)
-        } else {
+        if (r != null) {
             responderDireto(txt, r, voz)
+            return
         }
+        val tel = try { telefone.tentar(txt, voz) } catch (e: Throwable) { null }
+        if (tel != null) {
+            responderDireto(txt, tel, voz)
+            return
+        }
+        processarLLM(txt, voz)
     }
 
     private fun responderDireto(pergunta: String, resposta: String, voz: Boolean) {
@@ -767,14 +791,14 @@ class AssistenteService : Service() {
         ttsTentados.clear()
         ttsDiag = ""
         ttsFalha = ""
-        val motores = try {
+        val motoresTts = try {
             packageManager.queryIntentServices(
                 Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0
             ).map { it.serviceInfo.packageName }.distinct()
         } catch (_: Throwable) {
             emptyList()
         }
-        ttsFila.addAll(motores.sortedBy { if (it == GOOGLE_TTS) 0 else 1 })
+        ttsFila.addAll(motoresTts.sortedBy { if (it == GOOGLE_TTS) 0 else 1 })
         abrirTts(null)
     }
 
@@ -883,7 +907,8 @@ class AssistenteService : Service() {
     private fun depoisDeFalar() {
         rosto("🙂")
         if (!ocupado && !estadoTxt.startsWith("Voz")) estado(pronta())
-        if (modoConversa && !ocupado) ouvir()
+        val reouvir = telefone.consumirAguarda() || modoConversa
+        if (reouvir && !ocupado) ouvir()
     }
 
     // ---------- Comandos sobre a voz (escritos ou falados) ----------
@@ -1312,7 +1337,7 @@ class AssistenteService : Service() {
                     .setState(PlaybackState.STATE_PLAYING, 0L, 1f)
                     .build()
             )
-            ms.isActive = true
+            ms.isActive = prefs.getBoolean("auricular", true)
             sessaoMidia = ms
         } catch (_: Throwable) {
         }
