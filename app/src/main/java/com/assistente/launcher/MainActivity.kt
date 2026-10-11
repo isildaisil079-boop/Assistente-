@@ -65,6 +65,7 @@ class MainActivity : Activity() {
     private var modeloAtual: Modelo = RAPIDO
     private var pediuPerm = false
     private var tela = ""
+    private var permTv: TextView? = null
 
     private lateinit var face: TextView
     private lateinit var status: TextView
@@ -95,7 +96,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        AssistenteService.appVisivel = true
         AssistenteService.ouvinte = AssistenteService.Ouvinte { atualizarUi() }
+        if (tela == "config") permTv?.text = textoPermissoes()
         if (tela == "chat" && ::chat.isInitialized) {
             if (AssistenteService.instance == null && modeloOk() &&
                 !prefs.getBoolean("parado", false) && !DownloadService.running
@@ -105,6 +108,11 @@ class MainActivity : Activity() {
                 atualizarUi()
             }
         }
+    }
+
+    override fun onPause() {
+        AssistenteService.appVisivel = false
+        super.onPause()
     }
 
     // ---------- Componentes comuns ----------
@@ -166,6 +174,15 @@ class MainActivity : Activity() {
         return mi.totalMem / 1_000_000_000.0
     }
 
+    private fun estadoPerm(p: String) =
+        if (checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED) "✅" else "❌"
+
+    private fun textoPermissoes() =
+        "Contactos ${estadoPerm(Manifest.permission.READ_CONTACTS)} · " +
+            "Chamadas ${estadoPerm(Manifest.permission.CALL_PHONE)} · " +
+            "SMS ${estadoPerm(Manifest.permission.SEND_SMS)} · " +
+            "Sobrepor a outras apps ${if (Settings.canDrawOverlays(this)) "✅" else "❌"}"
+
     // ---------- Configurações ----------
     private fun mostrarConfig(primeiraVez: Boolean) {
         tela = "config"
@@ -201,7 +218,7 @@ class MainActivity : Activity() {
         col.addView(
             nota(
                 "O idioma muda a voz, o reconhecimento e a língua das respostas da IA. " +
-                    "Os comandos (alarmes, notas…) e os menus estão, por agora, só em português."
+                    "Os comandos (alarmes, notas, chamadas…) e os menus estão, por agora, só em português."
             )
         )
 
@@ -317,6 +334,56 @@ class MainActivity : Activity() {
                     "Usa as definições de voz e escolhe o motor da Google."
             }
         })
+
+        // Auricular
+        col.addView(secao("Auricular"))
+        val chkAur = CheckBox(this).apply {
+            text = "O botão do auricular ativa a Aria"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.getBoolean("auricular", true)
+        }
+        col.addView(chkAur)
+        col.addView(
+            nota(
+                "Ligado, o botão do auricular fala com a Aria em vez de controlar a tua app de música. " +
+                    "Desliga-o se preferires que continue a controlar a música."
+            )
+        )
+
+        // Permissões
+        col.addView(secao("Permissões (chamadas, mensagens, música)"))
+        val pTv = texto(textoPermissoes(), 13f, "#C0C0E0")
+        permTv = pTv
+        col.addView(pTv)
+        col.addView(
+            nota(
+                "• Contactos: para encontrar números pelo nome.\n" +
+                    "• Chamadas: para ligar diretamente depois de confirmares. Sem isto, abre o marcador.\n" +
+                    "• SMS: para enviar diretamente depois de confirmares (pode ter custo no teu plano). " +
+                    "Sem isto, abre a app de mensagens.\n" +
+                    "• Sobrepor a outras apps: permite abrir apps (marcador, WhatsApp, música) com o ecrã apagado. " +
+                    "Sem isto, a Aria deixa uma notificação em que tocas para continuar."
+            )
+        )
+        col.addView(botao("Autorizar contactos, chamadas e SMS") {
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.READ_CONTACTS,
+                    Manifest.permission.CALL_PHONE,
+                    Manifest.permission.SEND_SMS
+                ),
+                5
+            )
+        })
+        col.addView(botao("Permitir sobrepor a outras apps") {
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                )
+            } catch (e: Exception) {
+                msgTv.text = "Não consegui abrir esta definição. Procura “Sobrepor a outras apps” nas definições."
+            }
+        })
         col.addView(msgTv)
 
         // Guardar / cancelar
@@ -332,6 +399,7 @@ class MainActivity : Activity() {
                 .putString("modelo", modeloNovo.id)
                 .putString("whisper_var", varNova)
                 .putBoolean("whisper_pref", chkProp.isChecked)
+                .putBoolean("auricular", chkAur.isChecked)
                 .putBoolean("configurado", true)
                 .putBoolean("parado", false)
                 .apply()
@@ -418,6 +486,23 @@ class MainActivity : Activity() {
             )
         )
 
+        col.addView(secao("Chamadas, mensagens e música"))
+        col.addView(
+            texto(
+                "• Chamadas: “Liga para a mãe”, “Faz uma chamada ao João Silva”. Ela pergunta primeiro " +
+                    "“Queres que ligue a …?” e só liga se disseres sim.\n" +
+                    "• Mensagens: “Manda uma mensagem à Maria a dizer que chego tarde”. Lê-te o texto e pede " +
+                    "confirmação. O SMS vai direto (pode ter custo). Com “whatsapp” (“manda whatsapp ao Pedro a " +
+                    "dizer…”) abre a conversa com o texto pronto e tu tocas em enviar.\n" +
+                    "• Música: “Toca Queen”, “Toca Coldplay no Spotify”. Pede à tua app de música para procurar.\n" +
+                    "• Controlo: “Pausa”, “Continua”, “Próxima”, “Anterior”, “Aumenta o volume”, “Baixa o volume”.\n" +
+                    "• Precisa das permissões em ⚙ Configurações → Permissões. Com o ecrã apagado, só abre apps " +
+                    "se permitires “Sobrepor a outras apps”. Senão deixa uma notificação em que tocas.\n" +
+                    "• Se houver vários contactos parecidos, ela diz-te para especificar o nome.",
+                14f
+            )
+        )
+
         col.addView(secao("Comandos sobre a voz"))
         col.addView(
             texto(
@@ -453,7 +538,8 @@ class MainActivity : Activity() {
         col.addView(
             texto(
                 "• Conversas, notas e lembretes ficam no telemóvel.\n" +
-                    "• A internet só é usada para descarregar modelos, quando pedes.\n" +
+                    "• A internet só é usada para descarregar modelos, quando pedes. Pesquisas de música e " +
+                    "mensagens passam pelas apps que usares (Spotify, WhatsApp, operadora…).\n" +
                     "• A voz do sistema é fornecida pelo Android e pode usar a rede. A voz própria não usa.",
                 14f
             )
@@ -462,7 +548,7 @@ class MainActivity : Activity() {
         col.addView(secao("Ainda não faz (em desenvolvimento)"))
         col.addView(
             texto(
-                "• Ligar, enviar mensagens, tocar música e GPS.\n" +
+                "• GPS e informação online.\n" +
                     "• Modo online com interruptor.\n" +
                     "• Personagem personalizável (aparência e voz).\n" +
                     "• Chamar por “Ei ${nomeIA}” sem tocar em nada.",
@@ -738,10 +824,10 @@ class MainActivity : Activity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 3) {
-            garantirServico()
-        } else {
-            pedirIsencaoBateria()
+        when (requestCode) {
+            3 -> garantirServico()
+            5 -> permTv?.text = textoPermissoes()
+            else -> pedirIsencaoBateria()
         }
     }
 
