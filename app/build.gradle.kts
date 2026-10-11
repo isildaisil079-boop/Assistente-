@@ -11,7 +11,7 @@ android {
         applicationId = "com.assistente.launcher"
         minSdk = 30
         targetSdk = 35
-        versionCode = 15
+        versionCode = 16
         versionName = "0.8"
         ndk {
             abiFilters += listOf("arm64-v8a")
