@@ -29,6 +29,8 @@
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
         <package android:name="com.google.android.googlequicksearchbox" />
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
     </queries>
 
     <application
@@ -46,6 +48,15 @@
             android:name=".AssistenteService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+        <service
+            android:name=".OuvinteNotificacoes"
+            android:exported="true"
+            android:label="Assistente"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
         <receiver
             android:name=".AlarmeReceiver"
             android:exported="false">
