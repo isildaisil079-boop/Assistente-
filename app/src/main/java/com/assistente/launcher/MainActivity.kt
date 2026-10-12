@@ -58,6 +58,12 @@ val IDIOMAS = listOf(
     "fr-FR" to "Français"
 )
 
+val PAUSAS = listOf(
+    900 to "Rápida (0,9 s): responde mais depressa, mas pode cortar-te",
+    1200 to "Normal (1,2 s)",
+    1800 to "Paciente (1,8 s): espera mais antes de responder"
+)
+
 class MainActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
@@ -66,6 +72,7 @@ class MainActivity : Activity() {
     private var pediuPerm = false
     private var tela = ""
     private var permTv: TextView? = null
+    private var mostrarHistorico = false
 
     private lateinit var face: TextView
     private lateinit var status: TextView
@@ -77,6 +84,7 @@ class MainActivity : Activity() {
     private lateinit var conversaBtn: Button
     private lateinit var downloadBtn: Button
     private lateinit var acordarBtn: Button
+    private lateinit var histBtn: Button
 
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
     private fun modelo() = File(filesDir, modeloAtual.arquivo)
@@ -177,11 +185,18 @@ class MainActivity : Activity() {
     private fun estadoPerm(p: String) =
         if (checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED) "✅" else "❌"
 
+    private fun notifAcessoAtivo(): Boolean {
+        val l = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return l.contains(packageName)
+    }
+
     private fun textoPermissoes() =
         "Contactos ${estadoPerm(Manifest.permission.READ_CONTACTS)} · " +
             "Chamadas ${estadoPerm(Manifest.permission.CALL_PHONE)} · " +
             "SMS ${estadoPerm(Manifest.permission.SEND_SMS)} · " +
-            "Sobrepor a outras apps ${if (Settings.canDrawOverlays(this)) "✅" else "❌"}"
+            "Sobrepor a outras apps ${if (Settings.canDrawOverlays(this)) "✅" else "❌"} · " +
+            "Acesso às notificações (música) ${if (notifAcessoAtivo()) "✅" else "❌"}"
 
     // ---------- Configurações ----------
     private fun mostrarConfig(primeiraVez: Boolean) {
@@ -285,6 +300,29 @@ class MainActivity : Activity() {
             isChecked = prefs.getBoolean("whisper_pref", false)
         }
         col.addView(chkProp)
+
+        col.addView(texto("Pausa para terminar de falar (voz própria)", 14f, "#FFFFFF").apply {
+            setTypeface(null, Typeface.BOLD)
+        })
+        val pausaAtual = prefs.getInt("fim_fala_ms", 1200)
+        val (gP, rbP) = radios(
+            PAUSAS.map { it.second },
+            PAUSAS.indexOfFirst { it.first == pausaAtual }.let { if (it < 0) 1 else it }
+        )
+        col.addView(gP)
+        col.addView(
+            nota(
+                "É o silêncio que a Aria espera antes de achar que acabaste. " +
+                    "Se ela te corta a meio das frases, escolhe Paciente."
+            )
+        )
+        val chkDet = CheckBox(this).apply {
+            text = "Mostrar detalhes técnicos (áudio, velocidade)"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.getBoolean("detalhes", true)
+        }
+        col.addView(chkDet)
+
         col.addView(botao("⬇ Descarregar a voz própria escolhida") {
             if (s == null) {
                 msgTv.text = "A Aria está a dormir. Volta ao ecrã principal e toca em Acordar."
@@ -362,7 +400,9 @@ class MainActivity : Activity() {
                     "• SMS: para enviar diretamente depois de confirmares (pode ter custo no teu plano). " +
                     "Sem isto, abre a app de mensagens.\n" +
                     "• Sobrepor a outras apps: permite abrir apps (marcador, WhatsApp, música) com o ecrã apagado. " +
-                    "Sem isto, a Aria deixa uma notificação em que tocas para continuar."
+                    "Sem isto, a Aria deixa uma notificação em que tocas para continuar.\n" +
+                    "• Acesso às notificações: serve só para a Aria conseguir pôr a tua app de música a tocar. " +
+                    "Não lê nem guarda as tuas notificações."
             )
         )
         col.addView(botao("Autorizar contactos, chamadas e SMS") {
@@ -384,6 +424,15 @@ class MainActivity : Activity() {
                 msgTv.text = "Não consegui abrir esta definição. Procura “Sobrepor a outras apps” nas definições."
             }
         })
+        col.addView(botao("Dar acesso às notificações (para a música)") {
+            try {
+                startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                msgTv.text = "Se a opção da Aria aparecer a cinzento: Definições → Apps → Assistente → " +
+                    "⋮ (três pontos) → Permitir definições restritas. Depois volta aqui."
+            } catch (e: Exception) {
+                msgTv.text = "Não consegui abrir esta definição. Procura “Acesso às notificações” nas definições."
+            }
+        })
         col.addView(msgTv)
 
         // Guardar / cancelar
@@ -392,6 +441,7 @@ class MainActivity : Activity() {
             val idiomaNovo = IDIOMAS[rbI.indexOfFirst { it.isChecked }.coerceAtLeast(0)].first
             val modeloNovo = if (rbM[1].isChecked) MELHOR else RAPIDO
             val varNova = if (rbV[1].isChecked) "small" else "base"
+            val pausaNova = PAUSAS[rbP.indexOfFirst { it.isChecked }.coerceAtLeast(0)].first
             val mudouServico = modeloNovo.id != modeloAtual.id || nomeNovo != nomeIA
             prefs.edit()
                 .putString("nome", nomeNovo)
@@ -400,6 +450,8 @@ class MainActivity : Activity() {
                 .putString("whisper_var", varNova)
                 .putBoolean("whisper_pref", chkProp.isChecked)
                 .putBoolean("auricular", chkAur.isChecked)
+                .putBoolean("detalhes", chkDet.isChecked)
+                .putInt("fim_fala_ms", pausaNova)
                 .putBoolean("configurado", true)
                 .putBoolean("parado", false)
                 .apply()
@@ -466,7 +518,9 @@ class MainActivity : Activity() {
                     "• 🎧 Modo conversa: ela ouve, responde em voz alta e volta a ouvir sozinha. " +
                     "Pára depois de 3 silêncios seguidos.\n" +
                     "• Ecrã apagado: a notificação “${nomeIA} ativa” tem os botões 🎤 Falar e ⏹ Parar. " +
-                    "O botão do auricular também tenta ativá-la, mas depende do telemóvel.",
+                    "O botão do auricular também tenta ativá-la, mas depende do telemóvel.\n" +
+                    "• No ecrã principal vês só a tua última mensagem e a resposta. " +
+                    "O botão 📜 Histórico mostra toda a conversa.",
                 14f
             )
         )
@@ -492,9 +546,10 @@ class MainActivity : Activity() {
                 "• Chamadas: “Liga para a mãe”, “Faz uma chamada ao João Silva”. Ela pergunta primeiro " +
                     "“Queres que ligue a …?” e só liga se disseres sim.\n" +
                     "• Mensagens: “Manda uma mensagem à Maria a dizer que chego tarde”. Lê-te o texto e pede " +
-                    "confirmação. O SMS vai direto (pode ter custo). Com “whatsapp” (“manda whatsapp ao Pedro a " +
-                    "dizer…”) abre a conversa com o texto pronto e tu tocas em enviar.\n" +
-                    "• Música: “Toca Queen”, “Toca Coldplay no Spotify”. Pede à tua app de música para procurar.\n" +
+                    "confirmação. O SMS vai direto (pode ter custo). Com “WhatsApp” (“manda uma mensagem ao Pedro " +
+                    "pelo WhatsApp a dizer…”) abre a conversa com o texto pronto e tu tocas em enviar.\n" +
+                    "• Música: “Toca Queen”, “Toca Coldplay no Spotify”. Abre a tua app de música e, se deres " +
+                    "acesso às notificações, pede-lhe que toque. Nem todas as apps aceitam.\n" +
                     "• Controlo: “Pausa”, “Continua”, “Próxima”, “Anterior”, “Aumenta o volume”, “Baixa o volume”.\n" +
                     "• Precisa das permissões em ⚙ Configurações → Permissões. Com o ecrã apagado, só abre apps " +
                     "se permitires “Sobrepor a outras apps”. Senão deixa uma notificação em que tocas.\n" +
@@ -528,6 +583,7 @@ class MainActivity : Activity() {
             texto(
                 "• Ouvidos: a voz do sistema (Android/Google/Samsung), que depende do telemóvel, ou a voz própria " +
                     "(Whisper), que é independente e 100% offline. Base é mais rápida; Small é mais precisa.\n" +
+                    "• Se a voz própria te cortar a meio das frases, aumenta a pausa em ⚙ Configurações → Voz.\n" +
                     "• Boca: a voz de resposta vem do telemóvel. Se faltar o português, instala os dados de voz em " +
                     "⚙ Configurações → Voz.",
                 14f
@@ -548,8 +604,9 @@ class MainActivity : Activity() {
         col.addView(secao("Ainda não faz (em desenvolvimento)"))
         col.addView(
             texto(
-                "• GPS e informação online.\n" +
-                    "• Modo online com interruptor.\n" +
+                "• Bolha flutuante e atalhos para falar com um toque.\n" +
+                    "• Modelos de IA mais modernos.\n" +
+                    "• GPS e informação online, e modo online com interruptor.\n" +
                     "• Personagem personalizável (aparência e voz).\n" +
                     "• Chamar por “Ei ${nomeIA}” sem tocar em nada.",
                 14f
@@ -596,17 +653,23 @@ class MainActivity : Activity() {
             textSize = 13f; setTextColor(Color.parseColor("#A0A0C0"))
             gravity = Gravity.CENTER; setPadding(dp(16), dp(4), dp(16), dp(4))
         }
+        histBtn = botao(if (mostrarHistorico) "📜 Ocultar" else "📜 Histórico") {
+            mostrarHistorico = !mostrarHistorico
+            histBtn.text = if (mostrarHistorico) "📜 Ocultar" else "📜 Histórico"
+            atualizarUi()
+        }
         val barra = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), 0, dp(8), 0)
             addView(
-                botao("⚙ Configurações") { mostrarConfig(false) },
+                botao("⚙ Config.") { mostrarConfig(false) },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
             addView(
                 botao("ℹ Ajuda") { mostrarInfo() },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             )
+            addView(histBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f))
         }
         conversaBtn = Button(this).apply {
             text = "🎧 Modo conversa: desligado"
@@ -625,7 +688,7 @@ class MainActivity : Activity() {
             setOnClickListener { descarregar() }
         }
         chat = TextView(this).apply {
-            textSize = 16f; setTextColor(Color.WHITE)
+            textSize = 18f; setTextColor(Color.WHITE)
             setPadding(dp(16), dp(8), dp(16), dp(8))
         }
         scroll = ScrollView(this).apply { addView(chat) }
@@ -670,6 +733,16 @@ class MainActivity : Activity() {
     }
 
     // ---------- Estado vindo do serviço ----------
+    private fun ultimaTroca(t: String): String {
+        val k = t.lastIndexOf("\n\nTu: ")
+        val r = when {
+            k >= 0 -> t.substring(k + 2)
+            t.startsWith("Tu: ") -> t
+            else -> t.takeLast(500)
+        }
+        return r.trimEnd()
+    }
+
     private fun atualizarUi() {
         if (tela != "chat" || !::chat.isInitialized) return
         val s = AssistenteService.instance
@@ -687,10 +760,17 @@ class MainActivity : Activity() {
         }
         acordarBtn.visibility = View.GONE
         face.text = s.rostoTxt
-        status.text = s.estadoTxt
-        val novo = s.chatCompleto()
-        if (chat.text.toString() != novo) {
-            chat.text = novo
+        val diag = TranscritorWhisper.ultimaDiag
+        val extra = if (prefs.getBoolean("detalhes", true) && s.estadoTxt.startsWith("Pronta") &&
+            diag.isNotEmpty()
+        ) "\n$diag" else ""
+        status.text = s.estadoTxt + extra
+
+        val completo = s.chatCompleto()
+        val exibido = if (mostrarHistorico) completo else ultimaTroca(completo)
+        chat.textSize = if (mostrarHistorico) 14f else 18f
+        if (chat.text.toString() != exibido) {
+            chat.text = exibido
             scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
         }
         input.isEnabled = s.pronto
