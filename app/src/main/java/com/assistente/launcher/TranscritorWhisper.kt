@@ -13,10 +13,17 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 class TranscritorWhisper(private val ctx: Context) {
+
+    companion object {
+        // Informação técnica da última gravação (mostrada no estado)
+        @Volatile var ultimaDiag = ""
+    }
 
     // "base" ou "small"
     var variante: String = "base"
@@ -133,6 +140,7 @@ class TranscritorWhisper(private val ctx: Context) {
         rec?.let { return it }
         val d = pasta()
         val a = arquivos()
+        val fios = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(2, 4)
         val cfg = OfflineRecognizerConfig(
             featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
             modelConfig = OfflineModelConfig(
@@ -143,7 +151,7 @@ class TranscritorWhisper(private val ctx: Context) {
                     task = "transcribe"
                 ),
                 tokens = File(d, a[2]).absolutePath,
-                numThreads = 2,
+                numThreads = fios,
                 debug = false,
                 provider = "cpu",
                 modelType = "whisper"
@@ -176,6 +184,14 @@ class TranscritorWhisper(private val ctx: Context) {
         thread {
             var gravador: AudioRecord? = null
             try {
+                // Carrega o modelo em paralelo, enquanto gravas
+                thread {
+                    try { carregar() } catch (_: Throwable) {}
+                }
+
+                val fimFalaMs = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+                    .getInt("fim_fala_ms", 1200)
+
                 val sr = 16000
                 val minBuf = AudioRecord.getMinBufferSize(
                     sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
@@ -194,16 +210,18 @@ class TranscritorWhisper(private val ctx: Context) {
                 gravando = true
                 ar.startRecording()
 
-                val bloco = ShortArray(sr / 10)
-                val todos = ShortArray(sr * 15)
+                val passo = sr / 20 // blocos de 50 ms
+                val bloco = ShortArray(passo)
+                val todos = ShortArray(sr * 20)
                 var n = 0
-                var calib = 0
-                var ruido = 0.0
-                var limiar = 600.0
+                var piso = -1.0
+                var limFala = 400.0
+                var limSil = 250.0
                 var falou = false
-                var silencioMs = 0
+                var silMs = 0
                 var falaMs = 0
                 var tempoMs = 0
+                var inicioFala = 0
 
                 while (!cancelado() && !terminarJaFlag) {
                     val lidos = ar.read(bloco, 0, bloco.size)
@@ -218,24 +236,34 @@ class TranscritorWhisper(private val ctx: Context) {
                         soma += v * v
                     }
                     val rms = sqrt(soma / lidos)
-                    tempoMs += 100
-                    if (calib < 3) {
-                        ruido += rms
-                        calib++
-                        if (calib == 3) limiar = (ruido / 3.0 * 3.0).coerceIn(450.0, 2500.0)
+                    tempoMs += 50
+
+                    if (tempoMs <= 300) {
+                        // calibração: o valor mais baixo é o ruído de fundo
+                        piso = if (piso < 0) rms else minOf(piso, rms)
+                        limFala = (piso * 3.0).coerceIn(400.0, 3000.0)
+                        limSil = (piso * 2.0).coerceIn(250.0, 2000.0)
                         continue
                     }
-                    if (rms > limiar) {
+
+                    val emFala = if (falou) rms > limSil else rms > limFala
+                    if (emFala) {
                         if (!falou) {
                             falou = true
+                            inicioFala = n - lidos
                             aoComecarFala()
                         }
-                        falaMs += 100
-                        silencioMs = 0
+                        falaMs += 50
+                        silMs = 0
                     } else if (falou) {
-                        silencioMs += 100
+                        silMs += 50
+                    } else {
+                        // ainda sem fala: o ruído de fundo adapta-se ao ambiente
+                        piso = piso * 0.95 + rms * 0.05
+                        limFala = (piso * 3.0).coerceIn(400.0, 3000.0)
+                        limSil = (piso * 2.0).coerceIn(250.0, 2000.0)
                     }
-                    if (falou && silencioMs >= 1100 && falaMs >= 300) break
+                    if (falou && silMs >= fimFalaMs && falaMs >= 300) break
                     if (!falou && tempoMs >= 7000) break
                 }
 
@@ -243,12 +271,35 @@ class TranscritorWhisper(private val ctx: Context) {
                 gravando = false
                 if (cancelado()) return@thread
                 if (!falou) {
+                    ultimaDiag = String.format(
+                        Locale.US, "Sem fala detetada · ruído %.0f · limiar %.0f", piso, limFala
+                    )
                     aoFinal("", 0L, null)
                     return@thread
                 }
 
                 aoTranscrever()
-                val amostras = FloatArray(n) { todos[it] / 32768f }
+
+                // Recorte: 0,4 s antes da fala e 0,5 s de silêncio no fim
+                val ini = maxOf(0, inicioFala - sr * 4 / 10)
+                val cortar = (silMs - 500).coerceAtLeast(0) * sr / 1000
+                val fim = maxOf(ini + 1, n - cortar)
+
+                // Amplifica se o áudio estiver baixo
+                var pico = 0
+                for (k in ini until fim) {
+                    val a = abs(todos[k].toInt())
+                    if (a > pico) pico = a
+                }
+                val picoF = pico / 32768f
+                val ganho = if (picoF in 0.001f..0.6f) minOf(10f, 0.8f / picoF) else 1f
+                val amostras = FloatArray(fim - ini) { (todos[ini + it] * ganho) / 32768f }
+
+                ultimaDiag = String.format(
+                    Locale.US, "áudio %.1f s · pico %d%% · ruído %.0f · ganho x%.1f",
+                    (fim - ini) / 16000.0, (picoF * 100).toInt(), piso, ganho
+                )
+
                 val t0 = System.currentTimeMillis()
                 val r = carregar()
                 val s = r.createStream()
