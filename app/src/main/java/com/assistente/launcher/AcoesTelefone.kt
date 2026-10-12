@@ -7,10 +7,12 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.SearchManager
 import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
+import android.media.session.MediaSessionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -44,10 +46,18 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
 
     private fun norm(s: String) = Acoes.norm(s)
 
-    private val reMsg = Regex(
-        """^\s*(?:por favor[,\s]+)?(?:manda|mandar|envia|enviar|escreve|escrever)(?:-me)?\s+(?:uma\s+|um\s+)?(?:mensagem|sms|texto|whatsapp|zap|wpp)(?:\s+(?:de|por)\s+(?:sms|texto|whatsapp|zap|wpp))?\s+(?:a|à|ao|para)\s+(?:o\s+|a\s+)?(.+?)(?:\s+(?:a\s+dizer|dizendo|a\s+avisar\s+que|que\s+diga|que)\s*[:,]?\s*|\s*:\s*)(.+)$""",
+    private val reMsgMarcador = Regex(
+        """^\s*(?:por favor[,\s]+)?(?:manda|mandar|envia|enviar|escreve|escrever)(?:-me|\s+me)?\s+(.+?)\s+(?:a\s+dizer(?:\s+que)?|dizendo(?:\s+que)?|a\s+avisar(?:\s+que)?|que\s+diga|a\s+perguntar(?:\s+se)?|com\s+o\s+texto)\s*[:,]?\s*(.+)$""",
         setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
     )
+
+    private val reMsgDoisPontos = Regex(
+        """^\s*(?:por favor[,\s]+)?(?:manda|mandar|envia|enviar|escreve|escrever)(?:-me|\s+me)?\s+(.+?)\s*:\s*(.+)$""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+    )
+
+    private val reNomePlataforma = Regex("""(?i)\b(whats\s?app|watsap\w*|uatsap\w*|zap|wpp)\b""")
+    private val reTemMsg = Regex("""(?i)\b(mensagem|mensagens|sms|texto|whats\s?app|watsap\w*|uatsap\w*|zap|wpp)\b""")
 
     private val reLigar = Regex(
         """^(?:por favor )?(?:faz uma chamada|fazer uma chamada|liga|ligar|telefona|telefonar|chama|chamar|contacta|contactar)(?: me)?(?: para| a| ao)?(?: o| a| os| as)? (.+)$"""
@@ -96,6 +106,23 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
     }
 
     // ---------- Pedidos ----------
+    private fun limparAlvo(g: String): String {
+        var a = g
+        a = a.replace(Regex("(?i)\\b(uma|um)\\b"), " ")
+        a = a.replace(Regex("(?i)\\b(mensagens?|sms|textos?)\\b"), " ")
+        a = a.replace(
+            Regex("(?i)\\b(pelo|pela|no|na|por|via|em)\\s+(whats\\s?app|watsap\\w*|uatsap\\w*|zap|wpp)\\b"), " "
+        )
+        a = a.replace(reNomePlataforma, " ")
+        a = a.replace(Regex("\\s+"), " ").trim()
+        repeat(3) {
+            a = a.replace(
+                Regex("(?i)^(a|à|ao|aos|para|pro|pra|o|os|de|do|da|por|no|na|em|pelo|pela)\\s+"), ""
+            )
+        }
+        return a.trim()
+    }
+
     fun tentar(original: String, voz: Boolean): String? {
         val t = norm(original)
         if (t.isEmpty() || t.length > 220) return null
@@ -105,14 +132,17 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
             if (m != null) return m
         }
 
-        val mm = reMsg.find(original.trim())
-        if (mm != null) {
-            val alvo = mm.groupValues[1].trim()
-            var texto = mm.groupValues[2].trim()
-                .replace(Regex("^que\\s+", RegexOption.IGNORE_CASE), "")
+        val orig = original.trim()
+        val mm = reMsgMarcador.find(orig) ?: reMsgDoisPontos.find(orig)
+        if (mm != null && reTemMsg.containsMatchIn(mm.groupValues[1])) {
+            val g1 = mm.groupValues[1]
+            val whats = reNomePlataforma.containsMatchIn(g1)
+            val alvo = limparAlvo(g1)
+            var texto = mm.groupValues[2].trim().replace(Regex("(?i)^que\\s+"), "")
             texto = texto.replaceFirstChar { it.uppercase() }
-            val whats = Regex("\\b(whatsapp|zap|wpp)\\b", RegexOption.IGNORE_CASE).containsMatchIn(original)
-            return prepararMensagem(alvo, texto, whats, voz)
+            if (alvo.isNotEmpty() && texto.isNotEmpty()) {
+                return prepararMensagem(alvo, texto, whats, voz)
+            }
         }
 
         val ml = reLigar.find(t)
@@ -302,20 +332,68 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
         }
     }
 
-    private fun abrirWhatsapp(numero: String, nome: String, texto: String): String {
+    // Número em formato internacional, só com dígitos (para o WhatsApp)
+    private fun numeroInternacional(numero: String): String {
+        val limpo = numero.trim()
+        val dig = limpo.filter { it.isDigit() }
+        if (limpo.startsWith("+")) return dig
+        if (dig.startsWith("00")) return dig.substring(2)
         val pais = (ctx.getSystemService(TelephonyManager::class.java)?.simCountryIso ?: "")
             .uppercase().ifEmpty { Locale.getDefault().country }
-        val e164 = try { PhoneNumberUtils.formatNumberToE164(numero, pais) } catch (_: Throwable) { null }
-        val dig = (e164 ?: numero).filter { it.isDigit() }
-        val url = "https://wa.me/$dig?text=${Uri.encode(texto)}"
-        return when (lancar(Intent(Intent.ACTION_VIEW, Uri.parse(url)), "WhatsApp para $nome")) {
-            LANCADO -> "Abri o WhatsApp com a mensagem pronta. Toca em enviar."
-            NOTIFICACAO -> "Deixei uma notificação: toca para abrir o WhatsApp com $nome."
-            else -> "Não consegui abrir o WhatsApp."
+        val e164 = try { PhoneNumberUtils.formatNumberToE164(limpo, pais) } catch (_: Throwable) { null }
+        if (e164 != null) return e164.filter { it.isDigit() }
+        val prefixo = mapOf(
+            "PT" to "351", "BR" to "55", "ES" to "34", "FR" to "33", "GB" to "44", "US" to "1"
+        )[pais]
+        return if (prefixo != null && !dig.startsWith(prefixo)) prefixo + dig.trimStart('0') else dig
+    }
+
+    private fun abrirWhatsapp(numero: String, nome: String, texto: String): String {
+        val dig = numeroInternacional(numero)
+        val enc = Uri.encode(texto)
+        val tentativas = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("whatsapp://send?phone=$dig&text=$enc"))
+                .setPackage("com.whatsapp"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("whatsapp://send?phone=$dig&text=$enc"))
+                .setPackage("com.whatsapp.w4b"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$dig?text=$enc"))
+        )
+        for (i in tentativas) {
+            when (lancar(i, "WhatsApp para $nome")) {
+                LANCADO -> return "Abri o WhatsApp com a mensagem pronta para $nome. Toca em enviar."
+                NOTIFICACAO -> return "Deixei uma notificação: toca para abrir o WhatsApp com $nome."
+            }
         }
+        return "Não consegui abrir o WhatsApp. Está instalado neste telemóvel?"
     }
 
     // ---------- Música, média e volume ----------
+    private fun notifAcesso(): Boolean {
+        val l = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners")
+            ?: return false
+        return l.contains(ctx.packageName)
+    }
+
+    // Depois de abrir a app, pede à sessão de música que toque o que foi pedido
+    private fun tentarControlador(consulta: String, pacote: String?, tentativa: Int, max: Int) {
+        ui.postDelayed({
+            var feito = false
+            try {
+                val msm = ctx.getSystemService(MediaSessionManager::class.java)
+                val sessoes = msm.getActiveSessions(ComponentName(ctx, OuvinteNotificacoes::class.java))
+                    .filter { it.packageName != ctx.packageName }
+                val c = sessoes.firstOrNull { pacote != null && it.packageName == pacote }
+                    ?: sessoes.firstOrNull()
+                if (c != null) {
+                    c.transportControls.playFromSearch(consulta, Bundle())
+                    feito = true
+                }
+            } catch (_: Throwable) {
+            }
+            if (!feito && tentativa + 1 < max) tentarControlador(consulta, pacote, tentativa + 1, max)
+        }, 2500)
+    }
+
     private fun tocarMusica(consulta: String, pacote: String?): String {
         if (consulta.isBlank()) {
             teclaMidia(KeyEvent.KEYCODE_MEDIA_PLAY)
@@ -325,11 +403,14 @@ class AcoesTelefone(private val ctx: Context, private val svc: AssistenteService
             .putExtra(SearchManager.QUERY, consulta)
             .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
         if (pacote != null) i.setPackage(pacote)
-        return when (lancar(i, "Tocar $consulta")) {
-            LANCADO -> "A procurar $consulta na tua app de música."
-            NOTIFICACAO -> "Deixei uma notificação: toca para tocar $consulta."
-            else -> "Não encontrei nenhuma app de música que aceite este pedido."
-        }
+        val r = lancar(i, "Tocar $consulta")
+        if (r == SEM_APP) return "Não encontrei nenhuma app de música que aceite este pedido."
+        val acesso = notifAcesso()
+        if (acesso) tentarControlador(consulta, pacote, 0, if (r == LANCADO) 4 else 20)
+        val base = if (r == LANCADO) "A procurar $consulta na tua app de música."
+        else "Deixei uma notificação: toca para tocar $consulta."
+        return if (acesso) base
+        else "$base Para eu a pôr a tocar sozinha, ativa o acesso às notificações em ⚙ Configurações → Permissões."
     }
 
     private fun teclaMidia(tecla: Int) {
